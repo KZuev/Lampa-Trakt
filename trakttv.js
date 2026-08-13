@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.69';
+  var PLUGIN_VERSION = '3.2.70';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -10411,7 +10411,7 @@
     Lampa.SettingsApi.addParam({
       component: 'trakt',
       param: { name: 'trakttv_about', type: 'button' },
-      field: { name: 'v' + PLUGIN_VERSION + ' · LampaTrakt' },
+      field: { name: 'v' + PLUGIN_VERSION + ' · Lampa-Trakt' },
       onRender: function onRender(item) {
         item.find('.settings-param__name').append('<span style="opacity:.45;font-size:.82em;margin-left:.5em">· Основан на lampame.github.io/main/trakttv.js</span>');
       },
@@ -11732,13 +11732,13 @@
       var body = $('<div style="font-size:1.2em;line-height:1.5;font-weight:300"></div>');
       body.html('<div style="text-align:center;padding:3em;opacity:.6">Загрузка…</div>');
       Lampa.Modal.open({
-        title: 'LampaTrakt v' + PLUGIN_VERSION,
+        title: 'Lampa-Trakt v' + PLUGIN_VERSION,
         html: body,
         size: 'large',
         onBack: function() { Lampa.Modal.close(); Lampa.Controller.toggle('settings_component'); }
       });
       $.ajax({
-        url: 'https://raw.githubusercontent.com/kzuev/lampatrakt/main/README.md',
+        url: 'https://raw.githubusercontent.com/KZuev/Lampa-Trakt/main/README.md',
         dataType: 'text',
         timeout: 10000,
         success: function(md) {
