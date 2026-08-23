@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.71';
+  var PLUGIN_VERSION = '3.2.72';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -16649,6 +16649,13 @@
           var CAL_TARGET = CALENDAR_ROW_LIMIT;
           var CAL_CHUNK = 30;
           var CAL_MAX_CHUNKS = 3;
+          // Тот же ~90-дневный горизонт, что и у чанков календаря сериалов (CAL_CHUNK*CAL_MAX_CHUNKS)
+          // — без этой границы недостоверная/плейсхолдерная «цифровая» дата TMDB (type:4) на годы
+          // вперёд (у ещё не вышедшего в прокат фильма) попадала в upcomingIds без ограничений и
+          // заполняла строку «Хочу посмотреть» на главной нереальными для просмотра фильмами.
+          var MOVIE_DIGITAL_WINDOW_DAYS = CAL_CHUNK * CAL_MAX_CHUNKS;
+          var digitalCutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + MOVIE_DIGITAL_WINDOW_DAYS);
+          var digitalCutoffStr = digitalCutoffDate.getFullYear() + '-' + String(digitalCutoffDate.getMonth() + 1).padStart(2, '0') + '-' + String(digitalCutoffDate.getDate()).padStart(2, '0');
 
           function calChunkStart(i) {
             var d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i * CAL_CHUNK);
@@ -16717,7 +16724,7 @@
                       if (us) digitalDate = us.date;
                       else if (allDates.length) digitalDate = allDates[0].date;
                     }
-                    if (digitalDate && digitalDate >= todayStr) {
+                    if (digitalDate && digitalDate >= todayStr && digitalDate <= digitalCutoffStr) {
                       return resolve({ movie: movie, data: data, digitalDate: digitalDate });
                     }
                     var theatrical = data && data.release_date ? String(data.release_date).slice(0, 10) : null;
