@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.72';
+  var PLUGIN_VERSION = '3.2.73';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -2143,6 +2143,7 @@
           method: item.movie ? 'movie' : 'tv',
           card_type: item.movie ? 'movie' : 'tv',
           trakt_released: item.movie ? (media.released || null) : (media.first_aired ? media.first_aired.split('T')[0] : null),
+          trakt_status: typeof media.status === 'string' ? media.status.toLowerCase() : '',
           trakt_genres: Array.isArray(media.genres) ? media.genres : [],
           trakt_country: typeof media.country === 'string' ? media.country.toLowerCase() : '',
           runtime: Number(media.runtime || 0),
@@ -3994,6 +3995,25 @@
     div.textContent = label;
     firstUpcoming.parentNode.insertBefore(div, firstUpcoming);
   }
+  // Статусы Trakt (`extended=full`), однозначно говорящие о том, вышел ли контент, — используются
+  // как приоритетный сигнал ПЕРЕД годом (`release_date`/media.year), когда точной даты выхода
+  // (`trakt_released`) ещё нет. Без этого сериал в производстве без объявленной даты (first_aired
+  // пуст → trakt_released=null, год часто тоже не проставлен → 0) считался «уже вышедшим» по
+  // фолбэку `0 <= currentYear` и не попадал в «Ожидаемые» (см. Scooby-Doo Origins, status
+  // in production). `canceled` намеренно не классифицируется — может быть отменён и до, и после
+  // выхода первой серии, статус сам по себе об этом не говорит.
+  var TRAKT_NOT_YET_RELEASED_STATUSES = { 'in production': true, 'post production': true, 'planned': true, 'rumored': true, 'upcoming': true, 'pilot': true };
+  var TRAKT_ALREADY_RELEASED_STATUSES = { 'released': true, 'returning series': true, 'continuing': true, 'ended': true };
+  function isTraktItemUpcoming(item, todayStr, currentYear) {
+    var rel = item.trakt_released;
+    if (rel && /^\d{4}-\d{2}-\d{2}/.test(String(rel))) {
+      return String(rel).slice(0, 10) > todayStr;
+    }
+    var status = item.trakt_status || '';
+    if (TRAKT_NOT_YET_RELEASED_STATUSES[status]) return true;
+    if (TRAKT_ALREADY_RELEASED_STATUSES[status]) return false;
+    return (parseInt(item.release_date, 10) || 0) > currentYear;
+  }
   function rearrangeWatchlistUpcoming(data) {
     if (!data || !Array.isArray(data.results)) return data;
     var today = new Date();
@@ -4002,13 +4022,7 @@
     var released = [];
     var upcoming = [];
     data.results.forEach(function (item) {
-      var isUpcoming = false;
-      var rel = item.trakt_released;
-      if (rel && /^\d{4}-\d{2}-\d{2}/.test(String(rel))) {
-        isUpcoming = String(rel).slice(0, 10) > todayStr;
-      } else {
-        isUpcoming = (parseInt(item.release_date, 10) || 0) > currentYear;
-      }
+      var isUpcoming = isTraktItemUpcoming(item, todayStr, currentYear);
       if (isUpcoming) {
         upcoming.push(item);
       } else {
@@ -14217,11 +14231,9 @@
     var upcoming = [];
     (Array.isArray(results) ? results : []).forEach(function(item) {
       var isMovie = item.card_type === 'movie';
-      var rel = item.trakt_released;
-      var isReleased;
-      if (isMovie && !rel) isReleased = false;
-      else if (rel && /^\d{4}-\d{2}-\d{2}/.test(String(rel))) isReleased = String(rel).slice(0, 10) <= todayStr;
-      else isReleased = (parseInt(item.release_date, 10) || 0) <= currentYear;
+      // Тот же приоритет сигналов, что и в rearrangeWatchlistUpcoming (isTraktItemUpcoming):
+      // дата > статус Trakt (in production/planned/… → точно не вышел) > год-фолбэк.
+      var isReleased = isMovie && !item.trakt_released ? false : !isTraktItemUpcoming(item, todayStr, currentYear);
       if (isReleased) { released.push(item); return; }
       if (isMovie && item.id && upcomingIds.has(String(item.id))) { upcoming.push(item); return; }
       // иначе — отбрасываем (как и раньше)
