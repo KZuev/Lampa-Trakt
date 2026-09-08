@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.73';
+  var PLUGIN_VERSION = '3.2.74';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -16065,7 +16065,12 @@
   var UI_DEADLINE_CATEGORY_MS = 7000;
   var STALE_PRESENT_DEADLINE_MS = 0;
   var STALE_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
-  var STORAGE_CACHE_PREFIX = 'trakttv_row_cache_v1_';
+  // v2: бамп после фикса префетча watchlist без filterWatchlistRowResults (см. history) —
+  // одним махом сбрасывает у всех пользователей уже «протравленный» кэш (сырые данные без
+  // фильтра, из-за которых далёкие невышедшие плейсхолдеры типа «Avatar 5» лезли в первые
+  // слоты строки «Хочу посмотреть»). Старые v1-ключи остаются в localStorage как мёртвые
+  // записи — не читаются и не мешают.
+  var STORAGE_CACHE_PREFIX = 'trakttv_row_cache_v2_';
   var SOURCE_FILTER_FIELDS = ['trakt_source_ignore_watched', 'trakt_source_ignore_watchlisted'];
   function getUiDeadline(screen) {
     return screen === 'main' ? UI_DEADLINE_MAIN_MS : UI_DEADLINE_CATEGORY_MS;
@@ -16186,7 +16191,7 @@
     // .items-line__head, and more.onVisible crashes on null head when total_pages > 1.
     if (checkUpNextPermissions()) {
       configs.push({ name: 'TraktUpNextRow', apiMethod: 'upnext', limit: 36, displayLimit: 20, traktRow: 'upnext', displayTitle: Lampa.Lang.translate('trakttv_upnext'), component: 'trakt_upnext' });
-      configs.push({ name: 'TraktWatchlistRow', apiMethod: 'watchlist', limit: 100, displayLimit: 20, displayTitle: Lampa.Lang.translate('trakttv_watchlist'), component: 'trakt_watchlist', apiParams: function() { var s = getDefaultListSort(); return { sort: s.field + '/' + s.order, watchlistSort: s.field + '/' + s.order }; } });
+      configs.push({ name: 'TraktWatchlistRow', apiMethod: 'watchlist', limit: 100, displayLimit: 20, displayTitle: Lampa.Lang.translate('trakttv_watchlist'), component: 'trakt_watchlist', apiParams: function() { var s = getDefaultListSort(); return { sort: s.field + '/' + s.order, watchlistSort: s.field + '/' + s.order }; }, filter: function(results) { return filterWatchlistRowResults(results); } });
     }
     if (checkRecommendationsPermissions()) {
       configs.push({ name: 'TraktRecommendationsRow', apiMethod: 'recommendations', limit: 36, displayLimit: 20, displayTitle: Lampa.Lang.translate('trakttv_recommendations'), component: 'trakttv_recommendations' });
@@ -16199,7 +16204,14 @@
       Api[config.apiMethod](Object.assign({ limit: config.limit, page: 1 }, _pfExtraParams)).then(function (data) {
         var results = data && Array.isArray(data.results) ? data.results : [];
         if (!results.length) return;
-        var limited = config.displayLimit > 0 ? results.slice(0, config.displayLimit) : results;
+        // ВАЖНО: применяем тот же config.filter, что и createRowCall (:16453) — иначе префетч
+        // кэширует сырую страницу API, и она мгновенно показывается при следующем ремаунте
+        // строки (STALE_PRESENT_DEADLINE_MS=0), протравливая кэш до следующего TTL (6ч).
+        // Для watchlist это пускало невышедшие/далёкие плейсхолдеры (Avatar 5/4 и т.п.)
+        // в первые слоты вместо реально добавленных фильмов.
+        var filtered = typeof config.filter === 'function' ? config.filter(results) : results;
+        if (!filtered || !filtered.length) return;
+        var limited = config.displayLimit > 0 ? filtered.slice(0, config.displayLimit) : filtered;
         saveRowToCache(cacheKey, createRowPayload(config, data, normalizeContentData(limited)));
       })['catch'](function () {});
     });
