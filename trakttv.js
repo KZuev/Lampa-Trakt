@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.75';
+  var PLUGIN_VERSION = '3.2.76';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -556,6 +556,8 @@
     Lampa.Storage.set('trakt_token_expires_at', null);
   }
   function clearAuthStorage() {
+    var reason = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 'unspecified';
+    try { _authLogAdd('tokens_cleared', { reason: reason, snapshot: _authStateSnapshot() }); } catch (e) {}
     Lampa.Storage.set('trakt_token', null);
     Lampa.Storage.set('trakt_refresh_token', null);
     clearTokenExpiryMeta();
@@ -565,6 +567,7 @@
   }
   function setAuthBlocked() {
     var reason = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 'reauth_required';
+    try { _authLogAdd('auth_blocked', { reason: reason, snapshot: _authStateSnapshot() }); } catch (e) {}
     authBlocked = true;
     authBlockedReason = String(reason || 'reauth_required');
     authBlockedAt = Date.now();
@@ -1379,6 +1382,7 @@
               if (status === 429) {
                 var retryAfterSec = parseRetryAfterMs$1(error && error.headers ? error.headers : {});
                 rlEnterCooldown(retryAfterSec ? Math.round(retryAfterSec / 1000) : undefined);
+                _authLogAdd('refresh_rate_limited', { cooldownMs: rlGetCooldownRemainingMs() });
                 logWarn('Trakt rate limit on token refresh, global cooldown entered', {
                   cooldownMs: rlGetCooldownRemainingMs()
                 }, {
@@ -1390,7 +1394,7 @@
                 // чтобы крестик на иконке, тап→настройки и «Выйти» в настройках были согласованы.
                 var _terminalLogout = function _terminalLogout() {
                   setAuthBlocked("refresh_failed_".concat(error.status));
-                  clearAuthStorage();
+                  clearAuthStorage("refresh_failed_".concat(error.status));
                   try {
                     multiAccountGetAll().forEach(function (s) {
                       if (!s) return;
@@ -1411,16 +1415,19 @@
                 var _accessToken = Lampa.Storage.get('trakt_token');
                 if (_accessToken) {
                   return requestApiWithToken(_accessToken, 'GET', '/users/settings').then(function () {
+                    _authLogAdd('refresh_rejected_kept_session', { status: error.status });
                     logWarn('Refresh rejected but access token still valid — keeping session', undefined, {
                       debugOnly: true
                     });
                     // Резолвим старым (живым) токеном — вызывающий продолжит без логаута.
                     return { access_token: _accessToken };
                   })["catch"](function () {
+                    _authLogAdd('refresh_rejected_probe_failed', { status: error.status });
                     _terminalLogout();
                     throw error;
                   });
                 }
+                _authLogAdd('refresh_rejected_no_access_token', { status: error.status });
                 _terminalLogout();
               }
               throw error;
@@ -1436,7 +1443,25 @@
     if (refreshPromise) {
       return refreshPromise;
     }
-    refreshPromise = refreshTokens(options)["finally"](function () {
+    refreshPromise = refreshTokens(options)["catch"](function (error) {
+      // Тот же принцип, что и для отвергнутого refresh (v3.2.69): если рефреш провалился
+      // ТОЛЬКО из-за отсутствия refresh-токена в плоском хранилище (code:'no_refresh_token' —
+      // например, рассинхрон слота/хранилища), но access-токен ещё жив, не считаем это
+      // разлогином — снимаем блокировку, поставленную внутри _refreshTokens. Текущий вызов
+      // всё равно завершится ошибкой (рефреш реально не произошёл), но флаг «разлогинен»
+      // не залипнет — следующий вызов сможет работать с уже имеющимся access-токеном.
+      if (!(error && error.code === 'no_refresh_token')) throw error;
+      var accessToken = Lampa.Storage.get('trakt_token');
+      if (!accessToken) throw error;
+      return requestApiWithToken(accessToken, 'GET', '/users/settings').then(function () {
+        clearAuthBlocked();
+        _authLogAdd('no_refresh_token_kept_session', _authStateSnapshot());
+        throw error;
+      }, function () {
+        _authLogAdd('no_refresh_token_probe_failed', _authStateSnapshot());
+        throw error;
+      });
+    })["finally"](function () {
       refreshPromise = null;
     });
     return refreshPromise;
@@ -3286,9 +3311,9 @@
           });
         }
       },
-      logout: function logout() {
+      logout: function logout(reason) {
         clearAuthBlocked();
-        clearAuthStorage();
+        clearAuthStorage(reason || 'logout');
       }
     },
     addToWatchlist: function addToWatchlist(params) {
@@ -9730,8 +9755,8 @@
       slots.forEach(function (s) {
         if (s && s.guest_expires_at && now >= s.guest_expires_at) {
           if (s.slot === multiAccountGetActiveSlot()) {
-            try { if (Api$1) Api$1.auth.logout(); } catch (e) {}
-            clearAuthStorage();
+            try { if (Api$1) Api$1.auth.logout('guest_expired'); } catch (e) {}
+            clearAuthStorage('guest_expired');
           }
           multiAccountUpdateSlot(s.slot, {
             token: null, refresh_token: null, expires_at: null,
@@ -10608,7 +10633,7 @@
           logApiMissing();
           return;
         }
-        Api$1 && Api$1.auth.logout();
+        Api$1 && Api$1.auth.logout('legacy_menu_button');
         Lampa.Bell.push({
           text: Lampa.Lang.translate('trakttvLogoutNoty')
         });
@@ -10791,7 +10816,7 @@
                     }
                   } else if (a.action === 'logout') {
                     if (slotIndex === multiAccountGetActiveSlot()) {
-                      if (Api$1) Api$1.auth.logout();
+                      if (Api$1) Api$1.auth.logout('manual_logout');
                     }
                     multiAccountUpdateSlot(slotIndex, { token: null, refresh_token: null, expires_at: null, label: null, alias: null, avatar: null, vip: null, guest_expires_at: null });
                     try { Lampa.Settings.update(); } catch (e) {}
@@ -11480,6 +11505,7 @@
             { title: 'Отладка: навигация Ещё',                       action: 'nav'           },
             { title: 'Диагностика сетки постеров',                   action: 'grid'          },
             { title: 'История отметок просмотренного (' + _watchMarkLog.length + ')', action: 'watchlog' },
+            { title: 'Журнал авторизации (' + _authEventLog.length + ')',                action: 'authlog'  },
             { title: 'Диагностика списков (' + _listLog.length + ')',                 action: 'listlog'  },
             { title: 'Дамп watched-серий',                                            action: 'watched_dump' },
             { title: 'Сравнение высоты списков',                                     action: 'height'   },
@@ -11493,6 +11519,7 @@
             if (item.action === 'nav')           { _showDebugNav();           }
             if (item.action === 'grid')          { _showDebugGrid();          }
             if (item.action === 'watchlog')      { _showDebugWatchLog();      }
+            if (item.action === 'authlog')       { _showDebugAuthLog();       }
             if (item.action === 'listlog')       { _showDebugListLog();       }
             if (item.action === 'watched_dump')  { _showDebugWatchedDump();   }
             if (item.action === 'height')        { _showDebugHeightCompare(); }
@@ -11823,6 +11850,54 @@
         onSelect: function(item) {
           if (item._copy)  _copyToClipboard(item._copy);
           if (item._clear) { _watchMarkLog.length = 0; try { Lampa.Storage.set('trakt_watch_log', []); } catch(e) {} Lampa.Noty.show('Лог очищен'); }
+        },
+        onBack: function() { Lampa.Controller.toggle('settings_component'); }
+      });
+    }
+
+    function _showDebugAuthLog() {
+      // Restore from storage on first open after restart
+      if (!_authEventLog.length) {
+        try {
+          var stored = Lampa.Storage.get('trakt_auth_log');
+          if (Array.isArray(stored) && stored.length) _authEventLog = stored;
+        } catch(e) {}
+      }
+      var log = _authEventLog.slice();
+      if (!log.length) {
+        Lampa.Select.show({ title: 'Журнал авторизации', items: [{ title: 'Пока пусто — событий разлогина не было' }],
+          onSelect: function() {}, onBack: function() { Lampa.Controller.toggle('settings_component'); } });
+        return;
+      }
+      var fmtDetails = function(d) {
+        if (!d) return '';
+        var parts = [];
+        if (d.reason) parts.push('reason=' + d.reason);
+        if (d.status !== undefined) parts.push('status=' + d.status);
+        if (d.cooldownMs !== undefined) parts.push('cooldownMs=' + d.cooldownMs);
+        var snap = d.snapshot || (d.hasAccessToken !== undefined ? d : null);
+        if (snap) {
+          parts.push('token=' + (snap.hasAccessToken ? 'есть' : 'нет'));
+          parts.push('refresh=' + (snap.hasRefreshToken ? 'есть' : 'нет'));
+          if (snap.activeSlot !== undefined && snap.activeSlot !== null) parts.push('slot=' + snap.activeSlot);
+        }
+        return parts.join(' | ');
+      };
+      var items = log.map(function(e) {
+        var time = e.ts ? (e.ts.slice(5, 10) + ' ' + e.ts.slice(11, 19)) : '?';
+        return { title: time + ' | ' + e.event, description: fmtDetails(e.details) };
+      });
+      var fullText = log.map(function(e) {
+        return [e.ts, e.event, fmtDetails(e.details)].join('\t');
+      }).join('\n');
+      items.push({ title: '[ Скопировать лог ]', _copy: fullText });
+      items.push({ title: '[ Очистить лог ]',    _clear: true });
+      Lampa.Select.show({
+        title: 'Журнал авторизации (' + log.length + ')',
+        items: items,
+        onSelect: function(item) {
+          if (item._copy)  _copyToClipboard(item._copy);
+          if (item._clear) { _authEventLog.length = 0; try { Lampa.Storage.set('trakt_auth_log', []); } catch(e) {} Lampa.Noty.show('Лог очищен'); }
         },
         onBack: function() { Lampa.Controller.toggle('settings_component'); }
       });
@@ -16250,8 +16325,33 @@
   var _watchMarkLog = [];
   var _listLog = [];
   var _heightCaptures = [];
-  var _lastWatchContext = null; // { percent, minProg, hash, trigger } — set before finish(), read in addToHistory$1
+  var _authEventLog = [];
+  var _lastWatchContext = null; // { percent, minProg, hash, trigger } — set before finish(), read в addToHistory$1
   var _traktRowsByTitle = {};
+
+  // Снимок состояния авторизации без самих значений токенов (только присутствие/длина/
+  // хвост фингерпринта, как у getAccessTokenFingerprint) — безопасно копировать в лог/буфер.
+  function _authStateSnapshot() {
+    try {
+      return {
+        hasAccessToken: !!Lampa.Storage.get('trakt_token'),
+        hasRefreshToken: !!Lampa.Storage.get('trakt_refresh_token'),
+        activeSlot: typeof multiAccountGetActiveSlot === 'function' ? multiAccountGetActiveSlot() : null,
+        fp: getAccessTokenFingerprint()
+      };
+    } catch (e) { return null; }
+  }
+  // Персистентный журнал событий авторизации (слёт/восстановление сессии Trakt) — для
+  // диагностики «периодически выкидывает из аккаунта». Независим от isDebugEnabled()
+  // (который сейчас всегда false и глушит logWarn/logDebug) — пишется всегда, без тумблера.
+  function _authLogAdd(event, details) {
+    try {
+      var entry = { ts: new Date().toISOString(), event: event, details: details || null };
+      _authEventLog.unshift(entry);
+      if (_authEventLog.length > 40) _authEventLog.length = 40;
+      Lampa.Storage.set('trakt_auth_log', _authEventLog);
+    } catch (e) {}
+  }
 
   function _listLogAdd(msg) {
     var ts = new Date().toISOString().slice(11, 19);
