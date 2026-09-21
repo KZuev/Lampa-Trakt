@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.74';
+  var PLUGIN_VERSION = '3.2.75';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -8192,6 +8192,28 @@
     return 0;
   }
 
+  // Плохой источник (TS/CAM/TC/screener) — экранка/телесинк, а не BDRip/WEB-DL. Такие релизы
+  // часто содержат в названии цифру разрешения (например «TS.1080p» — разрешение камеры/энкода,
+  // а не исходника), из-за чего qualityScore() выше ошибочно ставил их вровень с настоящим
+  // BDRip/WEB-DL того же разрешения, и дальше решали сиды — популярность перебивала качество
+  // вопреки настройке «качество затем популярность». Отдельная проверка, независимая от
+  // разрешения, всегда демотирует такие релизы в самый низ, независимо от режима качества.
+  function _atIsBadSourceRip(s) {
+    s = s || '';
+    return /\bcam-?rip\b/i.test(s) ||
+      /\bhd-?cam\b/i.test(s) ||
+      /\bhd-?ts\b/i.test(s) ||
+      /\bts-?rip\b/i.test(s) ||
+      /\btelesync\b/i.test(s) ||
+      /\bts\b/i.test(s) ||
+      /\btc-?rip\b/i.test(s) ||
+      /\btelecine\b/i.test(s) ||
+      /\btc\b/i.test(s) ||
+      /\bscr(?:eener)?\b/i.test(s) ||
+      /\bdvd-?scr\b/i.test(s) ||
+      /\bweb-?scr\b/i.test(s);
+  }
+
   // Проверка «торрент содержит сезон N» — паттерны из фильтра Lampa (torrents.js filtred)
   function _atTitleMatchesSeason(title, season) {
     title = (title || '').toLowerCase();
@@ -8287,6 +8309,9 @@
     var qualityMode = _atSetting('trakt_at_quality', 'max');
     var targetScore = { '4k': 4, '1080p': 3, '720p': 2 }[qualityMode] || 0;
     function effectiveQuality(title) {
+      // TS/CAM/TC/screener — всегда ниже любого легитимного рипа, вне зависимости от режима
+      // качества и от того, какая цифра разрешения указана в названии (см. _atIsBadSourceRip).
+      if (_atIsBadSourceRip(title)) return -1000;
       var q = qualityScore(title);
       if (!targetScore) return q;
       if (q === targetScore) return 100;
@@ -8337,7 +8362,12 @@
     });
     var pool = dubbed.length ? dubbed : collected;
     return pool.slice().sort(function(a, b) {
-      return qualityScore((b.element.title || b.element.path || '')) - qualityScore((a.element.title || a.element.path || ''));
+      var titleA = a.element.title || a.element.path || '';
+      var titleB = b.element.title || b.element.path || '';
+      // Та же демотировка TS/CAM/TC/screener, что и в _atSortTorrentCandidates.
+      var qa = _atIsBadSourceRip(titleA) ? -1000 : qualityScore(titleA);
+      var qb = _atIsBadSourceRip(titleB) ? -1000 : qualityScore(titleB);
+      return qb - qa;
     })[0] || null;
   }
 
