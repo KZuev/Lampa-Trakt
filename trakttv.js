@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.77';
+  var PLUGIN_VERSION = '3.2.78';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -780,6 +780,29 @@
       !!(Lampa.Storage.get('trakt_sync_passphrase') || '') &&
       !!(Lampa.Storage.get('trakt_sync_pat') || '');
   }
+  // Человекочитаемый статус для settings-строки под настройками синхронизации.
+  function _syncStatusText() {
+    if (!_syncCryptoAvailable()) return '⚠ Недоступно: в этом окружении нет Web Crypto API (шифрование невозможно)';
+    if (!_syncEnabled()) return 'Выключена. Кнопка «Проверить синхронизацию» ниже работает и без включения тумблера.';
+    var passphrase = Lampa.Storage.get('trakt_sync_passphrase') || '';
+    var pat = Lampa.Storage.get('trakt_sync_pat') || '';
+    if (!passphrase || !pat) return 'Включена, но не настроена — заполните парольную фразу и GitHub-токен ниже';
+    var fmtDetail = function (detail) {
+      if (detail === 'empty') return ' (gist пуст — ещё не было ни одной отправки)';
+      if (detail === 'no_gist_yet') return ' (gist ещё не создан)';
+      return '';
+    };
+    var fmt = function (rec, label) {
+      if (!rec || !rec.ts) return label + ': ещё не было';
+      var when = new Date(rec.ts).toLocaleString();
+      return rec.ok
+        ? '✓ ' + label + ': ' + when + fmtDetail(rec.detail)
+        : '✗ ' + label + ': ' + when + ' — ошибка (' + rec.detail + ')';
+    };
+    var push = Lampa.Storage.get('trakt_sync_last_push');
+    var pull = Lampa.Storage.get('trakt_sync_last_pull');
+    return fmt(push, 'Отправка') + '<br>' + fmt(pull, 'Проверка (pull)');
+  }
   function _syncBytesFromB64(b64) {
     var bin = atob(b64);
     var bytes = new Uint8Array(bin.length);
@@ -854,6 +877,11 @@
     f[SYNC_GIST_FILENAME] = { content: content };
     return f;
   }
+  // Персистентный статус последней отправки/проверки — для видимого индикатора в настройках
+  // (см. секцию UI ниже) и кнопки «Проверить синхронизацию».
+  function _syncSetStatus(kind, ok, detail) {
+    try { Lampa.Storage.set('trakt_sync_last_' + kind, { ts: Date.now(), ok: !!ok, detail: detail || '' }); } catch (e) {}
+  }
   // Найти существующий gist синхронизации (по фиксированному description, без ручного
   // копирования id между устройствами) либо вернуть null, если такого ещё нет.
   function _syncResolveGistId() {
@@ -888,8 +916,10 @@
           .then(function (created) { if (created && created.id) Lampa.Storage.set('trakt_sync_gist_id', created.id); return created; });
       });
     }).then(function () {
+      _syncSetStatus('push', true, 'ok');
       _authLogAdd('sync_push_ok', null);
     })['catch'](function (err) {
+      _syncSetStatus('push', false, String((err && err.status) || 'error'));
       _authLogAdd('sync_push_failed', { status: err && err.status });
     });
   }
@@ -900,14 +930,18 @@
     if (!_syncConfigured()) return Promise.resolve(null);
     var passphrase = Lampa.Storage.get('trakt_sync_passphrase') || '';
     return _syncResolveGistId().then(function (gistId) {
-      if (!gistId) return null;
+      if (!gistId) { _syncSetStatus('pull', true, 'no_gist_yet'); return null; }
       return _syncGithubRequest('GET', '/gists/' + gistId).then(function (g) {
         var file = g && g.files && g.files[SYNC_GIST_FILENAME];
         var content = file && file.content;
-        if (!content) return null;
-        return _syncDecrypt(passphrase, content);
+        if (!content) { _syncSetStatus('pull', true, 'empty'); return null; }
+        return _syncDecrypt(passphrase, content).then(function (record) {
+          _syncSetStatus('pull', true, 'ok');
+          return record;
+        });
       });
     })['catch'](function (err) {
+      _syncSetStatus('pull', false, String((err && err.status) || 'error'));
       _authLogAdd('sync_pull_failed', { status: err && err.status });
       return null;
     });
@@ -10836,6 +10870,50 @@
         }, function (val) {
           Lampa.Storage.set('trakt_sync_pat', (val || '').trim());
           Lampa.Settings.update();
+        });
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_status', type: 'static' },
+      field: { name: '' },
+      onRender: function(item) {
+        item.empty();
+        item.append('<div class="settings-param__name" style="opacity:.8;font-size:.9em;line-height:1.5">' + _syncStatusText() + '</div>');
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_test', type: 'button' },
+      field: {
+        name: 'Проверить синхронизацию',
+        description: 'Отправит текущий токен (если авторизованы) и прочитает его обратно из gist — сразу покажет, работает ли связка PAT + парольная фраза + сеть'
+      },
+      onRender: function(item) { item.show(); },
+      onChange: function() {
+        if (!_syncCryptoAvailable()) { Lampa.Noty.show('Web Crypto недоступна в этом окружении — синхронизация невозможна здесь'); return; }
+        var passphrase = Lampa.Storage.get('trakt_sync_passphrase') || '';
+        var pat = Lampa.Storage.get('trakt_sync_pat') || '';
+        if (!passphrase || !pat) { Lampa.Noty.show('Сначала укажите парольную фразу и GitHub-токен'); return; }
+        Lampa.Noty.show('Проверка синхронизации…');
+        var hasToken = !!(Lampa.Storage.get('trakt_token') || '');
+        var wasEnabled = _syncEnabled();
+        if (!wasEnabled) Lampa.Storage.set('trakt_sync_enabled', true); // на время теста, чтобы push/pull не были no-op
+        var pushP = hasToken ? _syncPushCurrentTokens() : Promise.resolve();
+        pushP.then(function () {
+          return _syncPull();
+        }).then(function () {
+          if (!wasEnabled) Lampa.Storage.set('trakt_sync_enabled', false);
+          Lampa.Settings.update();
+          var lastPush = Lampa.Storage.get('trakt_sync_last_push');
+          var lastPull = Lampa.Storage.get('trakt_sync_last_pull');
+          var pushOk = !hasToken || (lastPush && lastPush.ok);
+          var pullOk = lastPull && lastPull.ok;
+          Lampa.Noty.show((pushOk && pullOk) ? 'Синхронизация работает' : 'Ошибка — подробности в Отладка → «Журнал авторизации»');
+        })['catch'](function () {
+          if (!wasEnabled) Lampa.Storage.set('trakt_sync_enabled', false);
+          Lampa.Settings.update();
+          Lampa.Noty.show('Ошибка проверки — подробности в Отладка → «Журнал авторизации»');
         });
       }
     });
