@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.76';
+  var PLUGIN_VERSION = '3.2.77';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -739,7 +739,204 @@
       clearAuthRateLimitCooldown();
     }
     multiAccountSnapshotActive();
+    if (response.access_token || response.refresh_token) { try { _syncPushCurrentTokens(); } catch (e) {} }
   }
+
+  // ── Синхронизация Trakt-токена между устройствами через приватный GitHub Gist ─────────
+  // Проблема: если один и тот же refresh-токен оказывается на нескольких устройствах
+  // (например, через бэкап/восстановление хранилища Lampa), устройство, которое обновится
+  // ПОЗЖЕ, предъявит Trakt уже устаревший (кем-то другим ротированный) refresh-токен — и
+  // Trakt в ответ отзывает ВСЮ пару токенов (реакция на подозрение в краже refresh-токена),
+  // выкидывая из аккаунта даже то устройство, которое ничего не делало (см. trakt_auth_log:
+  // одновременный 400 и на /oauth/token, и на проверочном /users/settings).
+  //
+  // Решение — не полагаться на редкие ручные бэкапы, а держать общий источник истины
+  // (зашифрованный gist) и СПРАШИВАТЬ его перед КАЖДОЙ попыткой обновления: если там уже
+  // лежит более свежая пара токенов (её туда положило другое устройство), просто принять
+  // её локально и не ходить к Trakt вообще — тогда единственный вызов /oauth/token для
+  // конкретного поколения токена всегда делает ровно одно устройство, и коллизия, которая
+  // приводит к отзыву всей пары, структурно не может возникнуть.
+  //
+  // Токены шифруются на устройстве (AES-GCM, ключ из пользовательской парольной фразы через
+  // PBKDF2) ДО отправки в gist — сам GitHub видит только шифротекст. Personal Access Token
+  // (нужен только для scope "gist") и парольная фраза хранятся локально в Lampa.Storage,
+  // как и остальные секреты плагина (Client ID/Secret) — это не более рискованно, чем то,
+  // что уже есть. Если Web Crypto недоступна в окружении, или PAT/фраза не заданы, или сеть
+  // недоступна — все операции тихо no-op'ятся (fail-open), обычный поток обновления токена
+  // продолжает работать как раньше (v3.2.69/v3.2.76), надёжность не ухудшается.
+  var SYNC_GITHUB_API = 'https://api.github.com';
+  var SYNC_GIST_DESCRIPTION = 'lampa-trakt-token-sync (не редактировать вручную)';
+  var SYNC_GIST_FILENAME = 'lampa-trakt-sync.json.enc';
+  var SYNC_PBKDF2_SALT = 'lampa-trakt-sync-salt-v1'; // фиксированная соль — секрет в самой парольной фразе
+
+  function _syncEnabled() {
+    return readBooleanStorage$2('trakt_sync_enabled', false);
+  }
+  function _syncCryptoAvailable() {
+    return !!(typeof window !== 'undefined' && window.crypto && window.crypto.subtle);
+  }
+  function _syncConfigured() {
+    return _syncEnabled() && _syncCryptoAvailable() &&
+      !!(Lampa.Storage.get('trakt_sync_passphrase') || '') &&
+      !!(Lampa.Storage.get('trakt_sync_pat') || '');
+  }
+  function _syncBytesFromB64(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  function _syncB64FromBytes(bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function _syncDeriveKey(passphrase) {
+    var enc = new TextEncoder();
+    return window.crypto.subtle.importKey('raw', enc.encode(passphrase), { name: 'PBKDF2' }, false, ['deriveKey']).then(function (keyMaterial) {
+      return window.crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: enc.encode(SYNC_PBKDF2_SALT), iterations: 100000, hash: 'SHA-256' },
+        keyMaterial,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    });
+  }
+  function _syncEncrypt(passphrase, obj) {
+    return _syncDeriveKey(passphrase).then(function (key) {
+      var iv = window.crypto.getRandomValues(new Uint8Array(12));
+      var data = new TextEncoder().encode(JSON.stringify(obj));
+      return window.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, data).then(function (cipherBuf) {
+        return _syncB64FromBytes(iv) + '.' + _syncB64FromBytes(new Uint8Array(cipherBuf));
+      });
+    });
+  }
+  function _syncDecrypt(passphrase, payload) {
+    var parts = String(payload || '').split('.');
+    if (parts.length !== 2) return Promise.reject(new Error('sync: bad payload format'));
+    var iv, cipherBytes;
+    try { iv = _syncBytesFromB64(parts[0]); cipherBytes = _syncBytesFromB64(parts[1]); }
+    catch (e) { return Promise.reject(e); }
+    return _syncDeriveKey(passphrase).then(function (key) {
+      return window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, cipherBytes);
+    }).then(function (plainBuf) {
+      return JSON.parse(new TextDecoder().decode(plainBuf));
+    });
+  }
+  function _syncGithubRequest(method, path, body) {
+    var pat = Lampa.Storage.get('trakt_sync_pat') || '';
+    var ajaxParams = {
+      url: SYNC_GITHUB_API + path,
+      timeout: 15000,
+      headers: {
+        'Authorization': 'Bearer ' + pat,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      type: method,
+      dataType: 'json',
+      crossDomain: true
+    };
+    if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
+      ajaxParams.data = JSON.stringify(body || {});
+      ajaxParams.contentType = 'application/json';
+      ajaxParams.processData = false;
+    }
+    return new Promise(function (resolve, reject) {
+      $.ajax(ajaxParams).done(resolve).fail(function (jqXHR) {
+        reject(Object.assign(new Error('GitHub sync request failed'), { status: jqXHR && jqXHR.status || 0 }));
+      });
+    });
+  }
+  function _syncMkFiles(content) {
+    var f = {};
+    f[SYNC_GIST_FILENAME] = { content: content };
+    return f;
+  }
+  // Найти существующий gist синхронизации (по фиксированному description, без ручного
+  // копирования id между устройствами) либо вернуть null, если такого ещё нет.
+  function _syncResolveGistId() {
+    var cachedId = Lampa.Storage.get('trakt_sync_gist_id') || '';
+    var verifyExisting = cachedId
+      ? _syncGithubRequest('GET', '/gists/' + cachedId).then(function (g) { return (g && g.id) ? g.id : null; })['catch'](function () { return null; })
+      : Promise.resolve(null);
+    return verifyExisting.then(function (id) {
+      if (id) return id;
+      return _syncGithubRequest('GET', '/gists?per_page=100').then(function (list) {
+        var found = Array.isArray(list) ? list.filter(function (g) { return g && g.description === SYNC_GIST_DESCRIPTION; })[0] : null;
+        if (found) { Lampa.Storage.set('trakt_sync_gist_id', found.id); return found.id; }
+        return null;
+      });
+    })['catch'](function () { return null; });
+  }
+  function _syncPushCurrentTokens() {
+    if (!_syncConfigured()) return Promise.resolve();
+    var record = {
+      access_token: Lampa.Storage.get('trakt_token') || '',
+      refresh_token: Lampa.Storage.get('trakt_refresh_token') || '',
+      created_at: getStorageNumber('trakt_token_created_at'),
+      expires_in: getStorageNumber('trakt_token_expires_in'),
+      expires_at: getStorageNumber('trakt_token_expires_at')
+    };
+    if (!record.access_token || !record.refresh_token) return Promise.resolve();
+    var passphrase = Lampa.Storage.get('trakt_sync_passphrase') || '';
+    return _syncEncrypt(passphrase, record).then(function (payload) {
+      return _syncResolveGistId().then(function (gistId) {
+        if (gistId) return _syncGithubRequest('PATCH', '/gists/' + gistId, { files: _syncMkFiles(payload) });
+        return _syncGithubRequest('POST', '/gists', { description: SYNC_GIST_DESCRIPTION, public: false, files: _syncMkFiles(payload) })
+          .then(function (created) { if (created && created.id) Lampa.Storage.set('trakt_sync_gist_id', created.id); return created; });
+      });
+    }).then(function () {
+      _authLogAdd('sync_push_ok', null);
+    })['catch'](function (err) {
+      _authLogAdd('sync_push_failed', { status: err && err.status });
+    });
+  }
+  // Прочитать актуальную запись из gist (или null, если синхронизация не настроена/недоступна/
+  // ещё не публиковалась). Все ошибки проглатываются намеренно — это диагностический сигнал
+  // (см. _authLogAdd), а не повод ломать обычный поток обновления токена.
+  function _syncPull() {
+    if (!_syncConfigured()) return Promise.resolve(null);
+    var passphrase = Lampa.Storage.get('trakt_sync_passphrase') || '';
+    return _syncResolveGistId().then(function (gistId) {
+      if (!gistId) return null;
+      return _syncGithubRequest('GET', '/gists/' + gistId).then(function (g) {
+        var file = g && g.files && g.files[SYNC_GIST_FILENAME];
+        var content = file && file.content;
+        if (!content) return null;
+        return _syncDecrypt(passphrase, content);
+      });
+    })['catch'](function (err) {
+      _authLogAdd('sync_pull_failed', { status: err && err.status });
+      return null;
+    });
+  }
+  // Вызывается ПЕРЕД каждой попыткой обновления (см. runRefreshFlow). Если в gist лежит
+  // пара токенов свежее локальной — принимает её на месте и возвращает {access_token},
+  // чтобы вызывающий пропустил реальный поход к Trakt за рефрешем. Иначе — null.
+  function _syncMaybeAdoptRemote() {
+    if (!_syncEnabled()) return Promise.resolve(null);
+    return _syncPull().then(function (remote) {
+      if (!remote || !remote.access_token || !remote.refresh_token) return null;
+      var localCreatedAt = getStorageNumber('trakt_token_created_at') || 0;
+      var remoteCreatedAt = Number(remote.created_at) || 0;
+      if (!remoteCreatedAt || remoteCreatedAt <= localCreatedAt) {
+        _authLogAdd('sync_pull_local_current', { localCreatedAt: localCreatedAt, remoteCreatedAt: remoteCreatedAt });
+        return null;
+      }
+      Lampa.Storage.set('trakt_token', remote.access_token);
+      Lampa.Storage.set('trakt_refresh_token', remote.refresh_token);
+      Lampa.Storage.set('trakt_token_created_at', remoteCreatedAt);
+      if (remote.expires_in) Lampa.Storage.set('trakt_token_expires_in', remote.expires_in);
+      if (remote.expires_at) Lampa.Storage.set('trakt_token_expires_at', remote.expires_at);
+      clearAuthBlocked();
+      try { multiAccountSnapshotActive(); } catch (e) {}
+      _authLogAdd('sync_pull_adopted_newer', { localCreatedAt: localCreatedAt, remoteCreatedAt: remoteCreatedAt });
+      return { access_token: remote.access_token };
+    });
+  }
+
   // ── Multi-Account Storage Layer ──────────────────────────────────────────
   var MULTI_MAX_SLOTS = 6;
   function multiAccountGetAll() {
@@ -1443,7 +1640,14 @@
     if (refreshPromise) {
       return refreshPromise;
     }
-    refreshPromise = refreshTokens(options)["catch"](function (error) {
+    // Перед реальным обновлением — спросить общий источник истины (синхронизация между
+    // устройствами, если настроена): если там уже лежит более свежая пара токенов, принять
+    // её и пропустить поход к Trakt вообще. Так только одно устройство когда-либо реально
+    // вызывает /oauth/token для конкретного поколения токена — коллизия ротации, которая
+    // приводит к отзыву всей пары (см. AGENTS.md, trakt_auth_log), структурно не возникает.
+    refreshPromise = _syncMaybeAdoptRemote().then(function (adopted) {
+      if (adopted) return adopted;
+      return refreshTokens(options)["catch"](function (error) {
       // Тот же принцип, что и для отвергнутого refresh (v3.2.69): если рефреш провалился
       // ТОЛЬКО из-за отсутствия refresh-токена в плоском хранилище (code:'no_refresh_token' —
       // например, рассинхрон слота/хранилища), но access-токен ещё жив, не считаем это
@@ -1460,6 +1664,7 @@
       }, function () {
         _authLogAdd('no_refresh_token_probe_failed', _authStateSnapshot());
         throw error;
+      });
       });
     })["finally"](function () {
       refreshPromise = null;
@@ -10569,6 +10774,84 @@
         });
       }
     });
+
+    // ── Секция: Синхронизация токена между устройствами ────────────────────────────
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_section', type: 'static' },
+      field: { name: '' },
+      onRender: function(item) {
+        item.empty();
+        item.append('<div class="settings-param__name" style="opacity:.55;font-weight:700">Синхронизация токена между устройствами</div>');
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_enabled', type: 'trigger', 'default': false },
+      field: {
+        name: 'Синхронизация между устройствами',
+        description: 'Держит Trakt-токен в актуальном состоянии на всех устройствах через приватный (secret) GitHub Gist — токен шифруется на устройстве перед отправкой, сам GitHub видит только шифротекст. Решает проблему «слетает авторизация», когда один и тот же вход используется на нескольких устройствах (например, через бэкап/восстановление). Нужны парольная фраза и GitHub-токен ниже — одинаковые на всех синхронизируемых устройствах'
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_passphrase', type: 'button' },
+      field: { name: 'Парольная фраза синхронизации' },
+      onRender: function onRender(item) {
+        item.find('.trakt-field-status').remove();
+        var val = Lampa.Storage.get('trakt_sync_passphrase') || '';
+        var status = val ? 'Указана (' + val.length + ' симв.)' : 'Не указана — придумайте длинную фразу, одинаковую на всех устройствах';
+        item.append('<div class="settings-param__value trakt-field-status" style="font-size:.85em;opacity:.65">' + status + '</div>');
+      },
+      onChange: function onChange() {
+        Lampa.Input.edit({
+          title: 'Парольная фраза синхронизации',
+          value: Lampa.Storage.get('trakt_sync_passphrase') || '',
+          free: true,
+          nosave: true,
+          nomic: true
+        }, function (val) {
+          Lampa.Storage.set('trakt_sync_passphrase', val || '');
+          Lampa.Settings.update();
+        });
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_pat', type: 'button' },
+      field: { name: 'GitHub Personal Access Token' },
+      onRender: function onRender(item) {
+        item.find('.trakt-field-status').remove();
+        var val = Lampa.Storage.get('trakt_sync_pat') || '';
+        var status = val ? 'Указан' : 'Не указан — создайте на github.com/settings/tokens токен ТОЛЬКО с правом «gist»';
+        item.append('<div class="settings-param__value trakt-field-status" style="font-size:.85em;opacity:.65">' + status + '</div>');
+      },
+      onChange: function onChange() {
+        Lampa.Input.edit({
+          title: 'GitHub Personal Access Token (scope: gist)',
+          value: Lampa.Storage.get('trakt_sync_pat') || '',
+          free: true,
+          nosave: true,
+          nomic: true
+        }, function (val) {
+          Lampa.Storage.set('trakt_sync_pat', (val || '').trim());
+          Lampa.Settings.update();
+        });
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_sync_forget_gist', type: 'button' },
+      field: {
+        name: 'Забыть привязанный Gist',
+        description: 'На случай проблем с синхронизацией — плагин заново найдёт или создаст gist по описанию при следующей попытке'
+      },
+      onRender: function(item) { item.show(); },
+      onChange: function() {
+        Lampa.Storage.set('trakt_sync_gist_id', null);
+        Lampa.Noty.show('Gist забыт, будет найден/создан заново');
+      }
+    });
     Lampa.SettingsApi.addParam({
       component: 'trakt',
       param: { name: 'trakt_api_help', type: 'button' },
@@ -11875,6 +12158,8 @@
         if (d.reason) parts.push('reason=' + d.reason);
         if (d.status !== undefined) parts.push('status=' + d.status);
         if (d.cooldownMs !== undefined) parts.push('cooldownMs=' + d.cooldownMs);
+        if (d.localCreatedAt !== undefined) parts.push('local=' + d.localCreatedAt);
+        if (d.remoteCreatedAt !== undefined) parts.push('remote=' + d.remoteCreatedAt);
         var snap = d.snapshot || (d.hasAccessToken !== undefined ? d : null);
         if (snap) {
           parts.push('token=' + (snap.hasAccessToken ? 'есть' : 'нет'));
