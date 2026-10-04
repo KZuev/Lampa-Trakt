@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.78';
+  var PLUGIN_VERSION = '3.2.79';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -780,6 +780,24 @@
       !!(Lampa.Storage.get('trakt_sync_passphrase') || '') &&
       !!(Lampa.Storage.get('trakt_sync_pat') || '');
   }
+  var SYNC_REFRESH_JITTER_MAX_MS = 6 * 60 * 60 * 1000; // 0..6 часов
+  // Случайный, стабильный на устройстве сдвиг — размазывает момент, когда РАЗНЫЕ устройства
+  // с ОДНИМ Trakt-аккаунтом решают, что пора обновлять токен. Без этого устройства, принявшие
+  // один и тот же токен через синхронизацию (_syncMaybeAdoptRemote), получают ОДИНАКОВЫЙ
+  // expires_at и почти гарантированно пытаются обновиться В ОДИН И ТОТ ЖЕ момент — гонка,
+  // которую не ловит проверка gist ПЕРЕД рефрешем (оба видят ещё валидный токен на момент
+  // проверки, т.к. ни один ещё не успел ротировать; коллизия происходит уже в самом запросе
+  // к Trakt). Токен живёт ~3 мес, так что обновиться на несколько часов раньше дедлайна
+  // совершенно безопасно — зато какое устройство обновится первым, опубликует новый токен в
+  // gist, а остальные при следующей проверке просто примут его вместо похода к Trakt.
+  function _syncRefreshJitterMs() {
+    var v = getStorageNumber('trakt_sync_refresh_jitter_ms');
+    if (v === null || v < 0) {
+      v = Math.floor(Math.random() * SYNC_REFRESH_JITTER_MAX_MS);
+      try { Lampa.Storage.set('trakt_sync_refresh_jitter_ms', v); } catch (e) {}
+    }
+    return v;
+  }
   // Человекочитаемый статус для settings-строки под настройками синхронизации.
   function _syncStatusText() {
     if (!_syncCryptoAvailable()) return '⚠ Недоступно: в этом окружении нет Web Crypto API (шифрование невозможно)';
@@ -1104,6 +1122,11 @@
     var _ref = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {},
       _ref$skewMs = _ref.skewMs,
       skewMs = _ref$skewMs === void 0 ? TOKEN_EXPIRY_SKEW_MS : _ref$skewMs;
+    // При включённой синхронизации между устройствами — расширяем «скоро истекает» своим
+    // случайным сдвигом (0..6ч), чтобы устройства с ОДИНАКОВЫМ expires_at (приняли один и
+    // тот же токен через синхронизацию) не пытались обновиться В ОДИН И ТОТ ЖЕ момент —
+    // см. _syncRefreshJitterMs(). Без синхронизации — поведение не меняется.
+    if (_syncConfigured()) skewMs += _syncRefreshJitterMs();
     var _getTokenExpiryMeta = getTokenExpiryMeta(),
       expiresAt = _getTokenExpiryMeta.expiresAt;
     // Неизвестный срок годности: если рабочий access-токен есть — НЕ форсируем рефреш заранее.
@@ -12248,10 +12271,11 @@
       };
       var items = log.map(function(e) {
         var time = e.ts ? (e.ts.slice(5, 10) + ' ' + e.ts.slice(11, 19)) : '?';
-        return { title: time + ' | ' + e.event, description: fmtDetails(e.details) };
+        var label = e.event + (e.count > 1 ? ' ×' + e.count : '');
+        return { title: time + ' | ' + label, description: fmtDetails(e.details) };
       });
       var fullText = log.map(function(e) {
-        return [e.ts, e.event, fmtDetails(e.details)].join('\t');
+        return [e.ts, e.event + (e.count > 1 ? ' ×' + e.count : ''), fmtDetails(e.details)].join('\t');
       }).join('\n');
       items.push({ title: '[ Скопировать лог ]', _copy: fullText });
       items.push({ title: '[ Очистить лог ]',    _clear: true });
@@ -16709,7 +16733,19 @@
   // (который сейчас всегда false и глушит logWarn/logDebug) — пишется всегда, без тумблера.
   function _authLogAdd(event, details) {
     try {
-      var entry = { ts: new Date().toISOString(), event: event, details: details || null };
+      var now = Date.now();
+      var last = _authEventLog[0];
+      // Коалесцируем всплески идентичных событий (например, много параллельных preflight-
+      // запросов одновременно натыкаются на один и тот же уже отклонённый single-flight
+      // рефреш и каждый логирует одно и то же) — иначе один всплеск может залить всю
+      // 40-записевую историю дублями и вытеснить действительно полезные более старые события.
+      if (last && last.event === event && JSON.stringify(last.details || null) === JSON.stringify(details || null) && (now - Date.parse(last.ts)) < 3000) {
+        last.count = (last.count || 1) + 1;
+        last.ts = new Date(now).toISOString();
+        Lampa.Storage.set('trakt_auth_log', _authEventLog);
+        return;
+      }
+      var entry = { ts: new Date(now).toISOString(), event: event, details: details || null };
       _authEventLog.unshift(entry);
       if (_authEventLog.length > 40) _authEventLog.length = 40;
       Lampa.Storage.set('trakt_auth_log', _authEventLog);
