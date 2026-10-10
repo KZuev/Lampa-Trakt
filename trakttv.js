@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.80';
+  var PLUGIN_VERSION = '3.2.81';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -16943,6 +16943,38 @@
       clearAllRowCaches();
     });
   }
+  // Lampa добавляет кнопку «Ещё» в .items-line__head в more.onVisible без проверки на уже
+  // существующую — при быстром скролле/возврате назад (и после Line.visible() в live-rebuild
+  // строк) onVisible срабатывает повторно, и в заголовке копятся несколько «Ещё». Чистим дубли
+  // прямо в DOM: одинаковые (тег+текст) элементы заголовка, кроме самого заголовка, — оставляем
+  // один (предпочтительно тот, что сейчас в фокусе).
+  function _dedupeLineHeadNow(headEl) {
+    var groups = {};
+    Array.prototype.slice.call(headEl.children).forEach(function (el) {
+      if (el.classList && el.classList.contains('items-line__title')) return;
+      var text = (el.textContent || '').trim();
+      if (!text) return;
+      var key = el.tagName + '|' + text;
+      (groups[key] = groups[key] || []).push(el);
+    });
+    Object.keys(groups).forEach(function (key) {
+      var list = groups[key];
+      if (list.length < 2) return;
+      var keep = list.filter(function (el) { return el.classList && el.classList.contains('focus'); })[0] || list[0];
+      list.forEach(function (el) {
+        if (el !== keep && el.parentNode) el.parentNode.removeChild(el);
+      });
+    });
+  }
+  function _guardLineHeadDuplicates(headEl) {
+    if (!headEl || headEl.__traktHeadGuard) return;
+    headEl.__traktHeadGuard = true;
+    _dedupeLineHeadNow(headEl);
+    if (typeof MutationObserver === 'undefined') return;
+    try {
+      new MutationObserver(function () { _dedupeLineHeadNow(headEl); }).observe(headEl, { childList: true });
+    } catch (e) {}
+  }
   function registerLineTitleDecorator() {
     Lampa.Listener.follow('line', function (e) {
       if (!e || e.type !== 'create' || !e.data || !e.data.trakt_line) return;
@@ -16955,6 +16987,10 @@
           debugOnly: true
         });
       }
+      try {
+        var head = e.line && e.line.render ? e.line.render().find('.items-line__head') : null;
+        if (head && head.length) _guardLineHeadDuplicates(head[0]);
+      } catch (error) {}
     });
     // Перехватываем событие 'more' для строк Трэкт, чтобы открывался правильный компонент.
     // Lampa 3.0 в некоторых версиях вместо вызова onMore() генерирует событие line{type:'more'},
