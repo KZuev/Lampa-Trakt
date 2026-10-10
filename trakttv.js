@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.81';
+  var PLUGIN_VERSION = '3.2.82';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -13908,6 +13908,11 @@
   var _externalPlayerActive = false;     // между запуском 'external' и его отметкой
   var _externalActiveUntil = 0;          // метка времени для корректного перезапуска
   var _externalClearTimer = null;        // резервный таймер сброса
+  // Хэши, о которых нативный плеер (Lampa-App) сообщает своё состояние
+  // событием 'native_playback': по ним start/pause шлёт onNativePlayback, а
+  // пауза из Timeline 'update' не нужна — она посреди просмотра снимала бы
+  // «Смотрит сейчас».
+  var _nativePlaybackHashes = {};
   var EXTERNAL_ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1000; // макс. длина сессии внешнего плеера
   var _upnextLineRef = null;             // ссылка на Line-инстанс строки Up Next на главной
   var _pendingMainRefresh = false;       // нужно обновить Up Next при следующем входе на главную
@@ -13955,6 +13960,7 @@
       if (window.Lampa && Lampa.Player && Lampa.Player.listener) {
         Lampa.Player.listener.follow('start', this.onPlayerStart.bind(this));
         Lampa.Player.listener.follow('external', this.onPlayerExternal.bind(this));
+        Lampa.Player.listener.follow('native_playback', this.onNativePlayback.bind(this));
         slog('Player listener attached');
       }
 
@@ -14287,7 +14293,9 @@
           // routeFinishIntent (где обычно живёт пауза) не срабатывает. Гард
           // _isPlayerActive исключает ложные 'update' при открытии списка
           // файлов торрента. Тротлинг по hash+% не даёт спамить одинаковыми.
-          if (_isPlayerActive && percent > 0) {
+          if (_nativePlaybackHashes[hash]) {
+            // Нативный плеер сам шлёт start/pause/stop (onNativePlayback).
+          } else if (_isPlayerActive && percent > 0) {
             var _pauseKey = String(hash) + '_' + Math.round(percent);
             if (_pauseKey !== _lastScrobblePauseKey) {
               _lastScrobblePauseKey = _pauseKey;
@@ -14432,6 +14440,95 @@
      * Единственный путь отправки финального запроса с идемпотентностью
      */
     finish: finish,
+    /**
+     * Состояние нативного плеера Lampa-App: событие Lampa.Player.listener
+     * 'native_playback' { state: 'playing'|'paused'|'stopped', hash, time,
+     * duration, percent, season, episode }. Шлём /scrobble/start на
+     * «играет» (Trakt показывает «Смотрит сейчас» с процентом, как у Infuse),
+     * /scrobble/pause на паузу и закрытие. Закрытие на пороге отметки и выше:
+     * историю пишет обычный путь (finish по Timeline 'update'), а здесь пауза
+     * только снимает «Смотрит сейчас», и созданную ею запись прогресса сразу
+     * удаляем — иначе досмотренное висело бы в «Смотреть дальше».
+     * /scrobble/stop не используем: на ≥80 % он сам добавляет просмотр в
+     * историю — вышел бы дубль с finish.
+     */
+    onNativePlayback: function onNativePlayback(ev) {
+      try {
+        if (!ev || !ev.hash || !ev.state) return;
+        if (!Lampa.Storage.field('trakt_enable_watching')) return;
+        if (!Lampa.Storage.get('trakt_token')) return;
+        var hash = ev.hash;
+        _nativePlaybackHashes[hash] = true;
+        var percent = parseFloat(ev.percent);
+        if (isNaN(percent)) percent = 0;
+        var meta = getHashMeta(hash);
+        var card = (meta && meta.card) || this.getCurrentCard();
+        if (!card) {
+          try { _watchLogAdd('native_nocard', { extra: ev.state + ' hash:' + String(hash).slice(0, 12) }); } catch(e) {}
+          return;
+        }
+        var season = (meta && meta.season) || ev.season;
+        var episode = (meta && meta.episode) || ev.episode;
+        if (!meta) setHashMeta(hash, { card: card, season: season, episode: episode, ids: card.ids });
+        var media = Object.assign({}, card, { hash: hash });
+        if (season) media.season_number = season;
+        if (episode) media.episode_number = episode;
+        if (meta && meta.ids) media.ids = meta.ids;
+        if (getContentType$1(media) === 'show' && !(season && episode)) {
+          try { _watchLogAdd('native_noepisode', { extra: ev.state + ' hash:' + String(hash).slice(0, 12) }); } catch(e) {}
+          return;
+        }
+        var self = this;
+        if (ev.state === 'playing') {
+          this.scrobbleSend('start', media, percent);
+        } else if (ev.state === 'paused') {
+          _lastScrobblePauseKey = String(hash) + '_' + Math.round(percent);
+          this.scrobblePause(media, percent);
+        } else if (ev.state === 'stopped') {
+          var minProgress = parseInt(Lampa.Storage.field('trakt_min_progress') || config.minProgress);
+          if (percent >= minProgress) {
+            this.scrobbleSend('pause', media, percent).then(function(res) {
+              if (res && res.id) return requestApi('DELETE', '/sync/playback/' + res.id);
+            }).then(function() {
+              try { _watchLogAdd('native_stop_cleared', { percent: Math.round(percent), extra: 'hash:' + String(hash).slice(0, 12) }); } catch(e) {}
+            })["catch"](function(err) {
+              try { _watchLogAdd('native_stop_error', { percent: Math.round(percent), extra: String(err).slice(0, 60) }); } catch(e) {}
+            });
+          } else {
+            _lastScrobblePauseKey = String(hash) + '_' + Math.round(percent);
+            this.scrobblePause(media, percent);
+          }
+        }
+      } catch(e) {
+        try { _watchLogAdd('native_error', { extra: String(e).slice(0, 60) }); } catch(e2) {}
+      }
+    },
+    /**
+     * /scrobble/{start|pause} с тем же телом, что и scrobblePause. Без
+     * побочных действий (лог, rebuild «Смотреть дальше») — их делает
+     * scrobblePause. Возвращает ответ Trakt (в нём id записи прогресса).
+     */
+    scrobbleSend: function scrobbleSend(action, media, percent) {
+      var contentType = this.getContentType(media);
+      var ids = Object.assign({}, media.ids);
+      if (!ids.tmdb && !ids.trakt && !ids.imdb && media.id) ids.tmdb = media.id;
+      var progress = Math.max(0, Math.min(100, percent || 0));
+      var body = contentType === 'movie'
+        ? { progress: progress, movie: { ids: ids } }
+        : { progress: progress,
+            show: { ids: ids },
+            episode: {
+              season: media.season_number || media.season,
+              number: media.episode_number || media.episode
+            }};
+      return requestApi('POST', '/scrobble/' + action, body).then(function(res) {
+        try { _watchLogAdd('scrobble_' + action + '_sent', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), season: media.season_number || media.season, episode: media.episode_number || media.episode, extra: 'native' }); } catch(e) {}
+        return res;
+      }, function(err) {
+        try { _watchLogAdd('scrobble_' + action + '_error', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), extra: String(err).slice(0, 60) }); } catch(e) {}
+        throw err;
+      });
+    },
     scrobblePause: function scrobblePause(media, percent) {
       var contentType = this.getContentType(media);
       if (!percent || percent <= 0) {
