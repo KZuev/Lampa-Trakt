@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.79';
+  var PLUGIN_VERSION = '3.2.80';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -8624,19 +8624,39 @@
       return 0;
     });
     // Торренты, ранее открытые в Lampa (hash есть в torrents_view), идут первыми —
-    // независимо от сортировки по качеству/популярности. Если таких несколько —
-    // их порядок между собой сохраняется из основной сортировки.
+    // независимо от сортировки по качеству/популярности. Для сериалов — дополнительно
+    // «спасаем» такой торрент из-под жёсткого фильтра озвучки (ищем по всему collected,
+    // а не только по уже прошедшему фильтр sorted) и требуем совпадение сезона, чтобы
+    // старый хэш от другого сезона/серии не вышел в приоритет для несвязанного поиска:
+    // раз пользователь уже успешно смотрел именно эту раздачу для этого сериала — она
+    // гарантированно подходит (нужный сезон, рабочая озвучка), реконструировать озвучку
+    // по названию не нужно, и жёсткий фильтр, который мог её исключить, здесь не помеха.
+    // Для фильмов поведение прежнее — буст действует только внутри pool, уже прошедшего
+    // фильтр озвучки (сезона у фильмов нет, перепроверять нечего).
+    function _atQualityPopComparator(a, b) {
+      var qa = effectiveQuality(a.element.Title || ''), qb = effectiveQuality(b.element.Title || '');
+      var pa = (a.element.Seeders || 0) + (a.element.Peers || 0);
+      var pb = (b.element.Seeders || 0) + (b.element.Peers || 0);
+      return popularityFirst ? (pb - pa || qb - qa) : (qb - qa || pb - pa);
+    }
     try {
       var viewed = Lampa.Storage.get('torrents_view', []);
       if (Array.isArray(viewed) && viewed.length) {
         var viewedSet = {};
         viewed.forEach(function(h) { viewedSet[h] = true; });
-        var prev = [], rest = [];
-        sorted.forEach(function(c) {
-          if (c.element && c.element.hash && viewedSet[c.element.hash]) prev.push(c);
-          else rest.push(c);
+        var isShowCtx = ctx && ctx.type === 'show';
+        var matches = (isShowCtx ? collected : sorted).filter(function(e) {
+          if (!(e && e.element && e.element.hash && viewedSet[e.element.hash])) return false;
+          if (isShowCtx && ctx.season) return _atTitleMatchesSeason(e.element.Title, ctx.season);
+          return true;
         });
-        if (prev.length) sorted = prev.concat(rest);
+        if (matches.length) {
+          var matchedHashes = {};
+          matches.forEach(function(e) { matchedHashes[e.element.hash] = true; });
+          var rest = sorted.filter(function(c) { return !(c.element && c.element.hash && matchedHashes[c.element.hash]); });
+          if (isShowCtx) matches.sort(_atQualityPopComparator);
+          sorted = matches.concat(rest);
+        }
       }
     } catch(e) {}
     return sorted;
