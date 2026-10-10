@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.82';
+  var PLUGIN_VERSION = '3.2.83';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -14522,7 +14522,19 @@
               number: media.episode_number || media.episode
             }};
       return requestApi('POST', '/scrobble/' + action, body).then(function(res) {
-        try { _watchLogAdd('scrobble_' + action + '_sent', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), season: media.season_number || media.season, episode: media.episode_number || media.episode, extra: 'native' }); } catch(e) {}
+        try { _watchLogAdd('scrobble_' + action + '_sent', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), season: media.season_number || media.season, episode: media.episode_number || media.episode, extra: 'native, trakt progress:' + (res && res.progress) }); } catch(e) {}
+        // Диагностика «Смотрит сейчас»: какое начало/конец просмотра Trakt
+        // поставил по нашему проценту (шкала и Live Activity Trakt рисуются
+        // по ним).
+        if (action === 'start') {
+          setTimeout(function() {
+            requestApi('GET', '/users/me/watching').then(function(w) {
+              try { _watchLogAdd('watching_now', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), extra: 'started:' + (w && w.started_at) + ' expires:' + (w && w.expires_at) + ' now:' + new Date().toISOString() }); } catch(e) {}
+            })["catch"](function(err) {
+              try { _watchLogAdd('watching_now_error', { extra: String(err).slice(0, 60) }); } catch(e) {}
+            });
+          }, 2000);
+        }
         return res;
       }, function(err) {
         try { _watchLogAdd('scrobble_' + action + '_error', { type: contentType, title: media && (media.title || media.name), percent: Math.round(progress), extra: String(err).slice(0, 60) }); } catch(e) {}
