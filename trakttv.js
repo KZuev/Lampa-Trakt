@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.87';
+  var PLUGIN_VERSION = '3.2.88';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -4643,6 +4643,7 @@
             onLong: function onLong() {
               if (type === 'myListItems' && object && object.can_manage && object.id) openMyListItemActions(object, element);
               else if (type === 'history') openHistoryItemActions(object, element);
+              else if (type === 'upnext' && getContentType$1(element) === 'movie') openUpnextMovieActions(element);
             }
           });
         }
@@ -4730,6 +4731,8 @@
           card.onMenu = function () { return openMyListItemActions(object, element); };
         } else if (type === 'history') {
           card.onMenu = function () { return openHistoryItemActions(object, element); };
+        } else if (type === 'upnext' && getContentType$1(element) === 'movie') {
+          card.onMenu = function () { return openUpnextMovieActions(element); };
         } else { card.onMenu = false; }
         card.onEnter = function () { Lampa.Activity.push(card.data); };
       };
@@ -5176,6 +5179,28 @@
       onBack: function onBack() {
         Lampa.Controller.toggle('content');
       }
+    });
+  }
+  // Долгое нажатие на фильм в полном списке «Смотреть дальше» — «Бросить просмотр».
+  // После удаления экран перерисовывается целиком (Activity.replace), а не вырезается карточка
+  // из DOM — иначе фокус пульта может остаться на удалённом элементе.
+  function openUpnextMovieActions(element) {
+    var tmdbId = element && (element.ids && element.ids.tmdb || element.id);
+    if (!tmdbId) return;
+    Lampa.Select.show({
+      title: element.title || element.original_title || 'Trakt.TV',
+      items: [dropMovieMenuItem()],
+      onSelect: function () {
+        Lampa.Controller.toggle('content');
+        runDropMovie(tmdbId, function (removed) {
+          if (!removed) return;
+          try {
+            var desc = getCurrentActivityDescriptor();
+            if (desc) Lampa.Activity.replace(Object.assign({}, desc, { refresh: Date.now() }));
+          } catch (e) {}
+        });
+      },
+      onBack: function () { Lampa.Controller.toggle('content'); }
     });
   }
   function openHistoryItemActions(object, element) {
@@ -7099,6 +7124,18 @@
       trakt_undrop_show: {
         ru: "Возобновить сериал",
         en: "Resume show",
+      },
+      trakt_drop_movie: {
+        ru: "Бросить просмотр",
+        en: "Drop watching",
+      },
+      trakt_drop_movie_done: {
+        ru: "Фильм убран из «Смотреть дальше»",
+        en: "Movie removed from Up Next",
+      },
+      trakt_drop_movie_none: {
+        ru: "Фильма нет в «Смотреть дальше»",
+        en: "Movie is not in Up Next",
       },
       trakt_menu_not_watched: {
         ru: "Отметить как не просмотрено",
@@ -9229,6 +9266,8 @@
                 isDropped: !!droppedState,
                 droppedTraktId: droppedState && droppedState.traktId
               });
+            } else {
+              extraItems.push(dropMovieMenuItem());
             }
             var allItems = statusItems.concat(extraItems).concat(buildManagerItems(!!watchlistState, withMembership));
             Lampa.Select.show({
@@ -9244,6 +9283,13 @@
                     notify(a.inFavorites ? t$2('trakt_favorites_remove', 'Убрать из избранного') : t$2('trakt_favorites_add', 'В избранное'));
                   }).catch(function() {
                     notify(t$2('trakt_list_action_error', 'List action failed'));
+                  });
+                  return;
+                }
+                if (a.target === 'drop_movie') {
+                  runDropMovie(itemId, function () {
+                    _invalidateListMenuCache(listParams);
+                    TraktHistory.showWatchProgress(data, element);
                   });
                   return;
                 }
@@ -15354,6 +15400,49 @@
     });
   }
 
+  // «Бросить просмотр» для фильма. Trakt-раздел «Брошенные» (/users/hidden/dropped) — только
+  // для сериалов, а фильм попадает в «Смотреть дальше» исключительно как незавершённый
+  // просмотр (/sync/playback). Поэтому «бросить» фильм = удалить ВСЕ его записи прогресса
+  // (их может быть несколько). Отмены нет: фильм вернётся сам, если снова начать его смотреть.
+  // Резолвится числом удалённых записей.
+  function dropMovieFromUpNext(tmdbId) {
+    tmdbId = String(tmdbId || '');
+    if (!tmdbId) return Promise.resolve(0);
+    return requestApi('GET', '/sync/playback?type=movies&extended=full&limit=100', {}, false, undefined, { cache: false }).then(function (list) {
+      var entries = (Array.isArray(list) ? list : []).filter(function (x) {
+        return x && x.id && x.movie && x.movie.ids && String(x.movie.ids.tmdb) === tmdbId;
+      });
+      return Promise.all(entries.map(function (x) {
+        return requestApi('DELETE', '/sync/playback/' + x.id);
+      })).then(function () { return entries.length; });
+    }).then(function (removed) {
+      if (removed) {
+        try { invalidateWatchedCache(); } catch (e) {}
+        try { clearRowCache(buildRowCacheKey({ name: 'TraktUpNextRow' }, {}, 'main')); } catch (e) {}
+        try { rebuildUpnextLineInPlace(); } catch (e) {}
+        try { refreshFullCardProgress(tmdbId); } catch (e) {}
+        try { _watchLogAdd('movie_dropped', { type: 'movie', id: tmdbId, extra: 'записей: ' + removed }); } catch (e) {}
+      }
+      return removed;
+    });
+  }
+  // Пункт меню + обработчик — один для всех меню Trakt у фильма.
+  function dropMovieMenuItem() {
+    return { title: t$2('trakt_drop_movie', 'Бросить просмотр'), target: 'drop_movie', action: 'trakt_drop_movie' };
+  }
+  function runDropMovie(tmdbId, onDone) {
+    return dropMovieFromUpNext(tmdbId).then(function (removed) {
+      notify(removed
+        ? t$2('trakt_drop_movie_done', 'Фильм убран из «Смотреть дальше»')
+        : t$2('trakt_drop_movie_none', 'Фильма нет в «Смотреть дальше»'));
+      if (onDone) try { onDone(removed); } catch (e) {}
+      return removed;
+    })["catch"](function () {
+      notify(t$2('trakt_list_action_error', 'List action failed'));
+      return 0;
+    });
+  }
+
   function isWatchedFromCache(tmdbId, type) {
     if (!_watchedCache || !tmdbId) return false;
     var s = String(tmdbId);
@@ -19131,18 +19220,31 @@
       },
       onContextLauch: function onContextLauch(object) {
         var extraOptions = {};
+        var appendItems = [];
         if (object && object._trakt_from_recommendations) {
-          extraOptions.appendItems = [{
+          appendItems.push({
             title: Lampa.Lang.translate('trakt_hide_recommendation_action') || 'Скрыть рекомендацию',
             action: 'trakt_hide_rec'
-          }];
-          extraOptions.onAppendSelect = function() {
-            Api$2.hideRecommendation(object)
-              .then(function() {
-                clearRecommendationsRowCache();
-                Lampa.Noty.show(Lampa.Lang.translate('trakt_recommendation_hidden') || 'Рекомендация скрыта');
-              })
-              ['catch'](function(err) { showApiError(err, 'trakt_hide_recommendation_error'); });
+          });
+        }
+        // Фильм — «Бросить просмотр» (убирает его из «Смотреть дальше», см. dropMovieFromUpNext)
+        var dropMovieTmdb = object && getContentType$1(object) === 'movie' ? (object.ids && object.ids.tmdb || object.id) : null;
+        if (dropMovieTmdb) appendItems.push(dropMovieMenuItem());
+        if (appendItems.length) {
+          extraOptions.appendItems = appendItems;
+          extraOptions.onAppendSelect = function(item) {
+            if (item && item.action === 'trakt_drop_movie') {
+              runDropMovie(dropMovieTmdb);
+              return;
+            }
+            if (item && item.action === 'trakt_hide_rec') {
+              Api$2.hideRecommendation(object)
+                .then(function() {
+                  clearRecommendationsRowCache();
+                  Lampa.Noty.show(Lampa.Lang.translate('trakt_recommendation_hidden') || 'Рекомендация скрыта');
+                })
+                ['catch'](function(err) { showApiError(err, 'trakt_hide_recommendation_error'); });
+            }
           };
         }
         setTimeout(function () {
