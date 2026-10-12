@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.83';
+  var PLUGIN_VERSION = '3.2.84';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -739,6 +739,11 @@
       clearAuthRateLimitCooldown();
     }
     multiAccountSnapshotActive();
+    // Фиксируем каждое получение токена (вход или успешный рефреш) со сроком жизни —
+    // чтобы по журналу было видно реальный expires_in от Trakt и успешные обновления.
+    if (response.access_token) {
+      try { _authLogAdd('tokens_saved', { expiresIn: Number.isFinite(expiresIn) ? expiresIn : null, newRefresh: response.refresh_token ? 'да' : 'нет' }); } catch (e) {}
+    }
     if (response.access_token || response.refresh_token) { try { _syncPushCurrentTokens(); } catch (e) {} }
   }
 
@@ -1617,7 +1622,10 @@
             return _context2.a(2, rlWaitForSlot('/oauth/token').then(function () {
               return _performRequest('POST', '/oauth/token', {
                 refresh_token: refresh_token,
-                redirect_uri: redirect_uri || '',
+                // Trakt требует redirect_uri при обмене refresh-токена — тот же, что
+                // зарегистрирован в приложении (наша инструкция: urn:ietf:wg:oauth:2.0:oob).
+                // Раньше уходила пустая строка — подозреваемая причина стабильного 400.
+                redirect_uri: redirect_uri || 'urn:ietf:wg:oauth:2.0:oob',
                 grant_type: 'refresh_token',
                 client_id: getClientId(),
                 client_secret: getClientSecret()
@@ -1644,6 +1652,23 @@
                 });
               }
               if (error && (error.status === 400 || error.status === 401)) {
+                // Точная причина отказа от Trakt (error/error_description из тела ответа) +
+                // контекст: что запустило рефреш и сколько оставалось до истечения токена.
+                // Без этого журнал не отличает «refresh-токен отозван» (invalid_grant) от
+                // «наш запрос некорректен» (invalid_request/invalid_client).
+                try {
+                  var _resp = error.response;
+                  var _isObj = _resp && _typeof(_resp) === 'object';
+                  var _expAt = getStorageNumber('trakt_token_expires_at');
+                  _authLogAdd('refresh_failed_detail', {
+                    status: error.status,
+                    errorCode: _isObj ? String(_resp.error || '') : '',
+                    errorDesc: String(_isObj ? (_resp.error_description || '') : (typeof _resp === 'string' ? _resp : '')).slice(0, 160),
+                    trigger: reason,
+                    expiresIn: getStorageNumber('trakt_token_expires_in'),
+                    expiresAtMinFromNow: _expAt ? Math.round((_expAt - Date.now()) / 60000) : null
+                  });
+                } catch (e) {}
                 // Терминальный отзыв refresh-токена — очищаем ВСЕ слоты, не только активный,
                 // чтобы крестик на иконке, тап→настройки и «Выйти» в настройках были согласованы.
                 var _terminalLogout = function _terminalLogout() {
@@ -1662,10 +1687,8 @@
                     refreshTraktAccountSwitcher();
                   } catch (e) {}
                 };
-                // Refresh-токен отвергнут (например, ротирован другим устройством с тем же
-                // аккаунтом), но access-токен может быть ещё жив (~3 мес). НЕ разлогиниваем,
-                // пока он рабочий — иначе на мультидевайсе авторизация слетает каждые несколько
-                // дней. Проверяем access-токен сырым запросом (минуя рефреш-машинерию).
+                // Refresh-токен отвергнут, но access-токен может быть ещё жив. НЕ разлогиниваем,
+                // пока он рабочий. Проверяем access-токен сырым запросом (минуя рефреш-машинерию).
                 var _accessToken = Lampa.Storage.get('trakt_token');
                 if (_accessToken) {
                   return requestApiWithToken(_accessToken, 'GET', '/users/settings').then(function () {
@@ -1675,8 +1698,10 @@
                     });
                     // Резолвим старым (живым) токеном — вызывающий продолжит без логаута.
                     return { access_token: _accessToken };
-                  })["catch"](function () {
-                    _authLogAdd('refresh_rejected_probe_failed', { status: error.status });
+                  })["catch"](function (probeErr) {
+                    // status — код исходного рефреша, probeStatus — собственный код проверки
+                    // access-токена (раньше не логировался, что сбивало с толку при разборе).
+                    _authLogAdd('refresh_rejected_probe_failed', { status: error.status, probeStatus: probeErr && probeErr.status });
                     _terminalLogout();
                     throw error;
                   });
@@ -12287,6 +12312,14 @@
           parts.push('refresh=' + (snap.hasRefreshToken ? 'есть' : 'нет'));
           if (snap.activeSlot !== undefined && snap.activeSlot !== null) parts.push('slot=' + snap.activeSlot);
         }
+        // Остальные простые поля — как есть (errorCode, errorDesc, trigger, expiresIn, probeStatus…)
+        var known = { reason: 1, status: 1, cooldownMs: 1, localCreatedAt: 1, remoteCreatedAt: 1, snapshot: 1, hasAccessToken: 1, hasRefreshToken: 1, activeSlot: 1, fp: 1 };
+        Object.keys(d).forEach(function(k) {
+          if (known[k]) return;
+          var v = d[k];
+          if (v === null || v === undefined || v === '' || typeof v === 'object') return;
+          parts.push(k + '=' + v);
+        });
         return parts.join(' | ');
       };
       var items = log.map(function(e) {
