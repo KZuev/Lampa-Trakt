@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.86';
+  var PLUGIN_VERSION = '3.2.87';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -11766,6 +11766,14 @@
         description: 'Как сортировать фильмы и сериалы в строке «Смотреть дальше» на главной и в её полном списке'
       }
     });
+    Lampa.SettingsApi.addParam({
+      component: 'trakt',
+      param: { name: 'trakt_watchlist_autoremove_shows', type: 'trigger', 'default': true },
+      field: {
+        name: 'Убирать начатые сериалы из «Хочу посмотреть»',
+        description: 'После отметки серии просмотренной сериал удаляется из списка «Хочу посмотреть» в Trakt и дальше показывается в «Смотреть дальше»'
+      }
+    });
     // ── Страница фильма и сериала ─────────────────────────────────────────────────
     Lampa.SettingsApi.addParam({
       component: 'trakt',
@@ -15315,6 +15323,35 @@
       }
       try { refreshFullCardProgress(tmdbId); } catch(e) {}
     }, 1500);
+    // Сериал начат (отмечена серия) — убираем его из «Хочу посмотреть»: дальше он живёт в
+    // «Смотреть дальше». Trakt сам этого для сериалов не делает (в отличие от фильмов).
+    if (mode === 'episode' && readBooleanStorage$2('trakt_watchlist_autoremove_shows', true)) {
+      try { _autoRemoveStartedShowFromWatchlist(data); } catch(e) {}
+    }
+  }
+
+  // Удаляет сериал из watchlist после отметки серии — только если он там действительно есть
+  // (по кэшу бейджей «Хочу посмотреть», без лишнего запроса на каждую серию). После успеха —
+  // то же, что ручное удаление из меню (кэш, бейджи), плюс перестройка строки на главной.
+  function _autoRemoveStartedShowFromWatchlist(data) {
+    var tmdbId = data && data.id;
+    if (!tmdbId) return;
+    var A = typeof api$1 !== 'undefined' && api$1 || null;
+    if (!A || typeof A.removeFromWatchlist !== 'function') return;
+    ensureWatchlistBadgeCache().then(function (cache) {
+      if (!cache || !cache.shows || !cache.shows.has(String(tmdbId))) return null;
+      return A.removeFromWatchlist({ method: 'tv', id: tmdbId, ids: data.ids || {} }).then(function () {
+        try { if (_watchlistBadgeCache && _watchlistBadgeCache.shows) _watchlistBadgeCache.shows["delete"](String(tmdbId)); } catch (e) {}
+        try {
+          document.querySelectorAll('.trakt-watchlist-badge[data-tmdb="' + tmdbId + '"]').forEach(function (el) { el.remove(); });
+        } catch (e) {}
+        try { clearRowCache(buildRowCacheKey({ name: 'TraktWatchlistRow' }, {}, 'main')); } catch (e) {}
+        try { rebuildWatchlistLineInPlace(); } catch (e) {}
+        try { _watchLogAdd('watchlist_autoremove', { type: 'show', ids: data.ids, id: tmdbId }); } catch (e) {}
+      });
+    })["catch"](function (err) {
+      try { _watchLogAdd('watchlist_autoremove_failed', { type: 'show', ids: data.ids, id: tmdbId, extra: 'status ' + (err && err.status) }); } catch (e) {}
+    });
   }
 
   function isWatchedFromCache(tmdbId, type) {
