@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.90';
+  var PLUGIN_VERSION = '3.2.91';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -11846,14 +11846,6 @@
         description: t$1('trakttv_badge_digital_date_descr', 'Показывать дату цифрового релиза на странице фильма')
       }
     });
-    Lampa.SettingsApi.addParam({
-      component: 'trakt',
-      param: { name: 'trakt_show_rating', type: 'trigger', 'default': true },
-      field: {
-        name: 'Рейтинг Trakt',
-        description: 'Показывать рейтинг Trakt рядом с IMDB на странице фильма и сериала. Нажатие открывает страницу на Trakt (на Apple TV — QR-код ссылки)'
-      }
-    });
     // ── Бейджи ───────────────────────────────────────────────────────────────────
     Lampa.SettingsApi.addParam({
       component: 'trakt',
@@ -15451,65 +15443,6 @@
     });
   }
 
-  // Рейтинг Trakt на странице фильма/сериала — справа от IMDB, той же разметкой, что родные
-  // рейтинги Lampa (full-start__rate). Один запрос /search/tmdb?extended=full даёт и рейтинг,
-  // и slug для ссылки; идёт как unauthorized — работает и без входа (нужен только Client ID).
-  function renderTraktRatingOnFullCard(renderRoot, tmdbId, method) {
-    if (!renderRoot || !renderRoot.length || !tmdbId) return;
-    if (!readBooleanStorage$2('trakt_show_rating', true)) return;
-    if (!getClientId()) return;
-    var type = (method === 'tv' || method === 'show') ? 'show' : 'movie';
-    requestApi('GET', '/search/tmdb/' + tmdbId + '?type=' + type + '&extended=full', {}, true).then(function (res) {
-      var media = Array.isArray(res) && res[0] && res[0][type];
-      if (!media || !media.ids) return;
-      var rating = Number(media.rating);
-      if (!Number.isFinite(rating) || rating <= 0) return;
-      var rateLine = renderRoot.find('.full-start-new__rate-line');
-      if (!rateLine.length || !document.body.contains(rateLine[0])) return;
-      ensureTraktRatingStyle();
-      rateLine.find('.rate--trakt').remove();
-      // app.trakt.tv — новое веб-приложение Trakt: локализовано (в т.ч. ru-RU) и само выбирает
-      // язык по языку устройства (Accept-Language) или по выбору в его настройках (cookie
-      // trakt-locale). Параметра языка в URL нет. Старый trakt.tv открывался по-английски.
-      var url = 'https://app.trakt.tv/' + (type === 'show' ? 'shows' : 'movies') + '/' + (media.ids.slug || media.ids.trakt);
-      var el = $('<div class="full-start__rate rate--trakt selector"><div></div><div class="source--name">Trakt</div></div>');
-      el.children().first().text(rating.toFixed(1));
-      el.on('hover:enter', function () { openTraktPage(url, media.title); });
-      var after = rateLine.find('.rate--imdb');
-      if (!after.length) after = rateLine.find('.rate--tmdb');
-      if (after.length) after.first().after(el);
-      else rateLine.prepend(el);
-    })["catch"](function () {});
-  }
-  function ensureTraktRatingStyle() {
-    if (document.getElementById('trakt-rating-style')) return;
-    var st = document.createElement('style');
-    st.id = 'trakt-rating-style';
-    st.textContent = '.full-start__rate.rate--trakt{cursor:pointer}' +
-      '.full-start__rate.rate--trakt.focus,.full-start__rate.rate--trakt.hover{box-shadow:0 0 0 .15em #fff}';
-    document.head.appendChild(st);
-  }
-  // Открыть страницу на Trakt. На Apple TV браузера нет — показываем QR-код ссылки, чтобы
-  // открыть её на телефоне. На остальных платформах — через систему (window.open): на iPhone
-  // ссылка trakt.tv откроется в приложении Trakt, если оно установлено и обрабатывает такие
-  // ссылки (universal links), иначе — в браузере.
-  function openTraktPage(url, title) {
-    if (Lampa.Platform && typeof Lampa.Platform.is === 'function' && Lampa.Platform.is('apple_tv') === true) {
-      var qr = 'https://api.qrserver.com/v1/create-qr-code/?size=420x420&data=' + encodeURIComponent(url);
-      var html = $('<div class="about" style="text-align:center"><img alt="QR" style="width:16em;max-width:100%;background:#fff;padding:.4em;border-radius:.6em"><div class="about__text" style="margin-top:.8em;word-break:break-all"></div></div>');
-      html.find('img').attr('src', qr);
-      html.find('.about__text').text(url);
-      Lampa.Modal.open({
-        title: title || 'Trakt.TV',
-        html: html,
-        size: 'small',
-        onBack: function () { Lampa.Modal.close(); Lampa.Controller.toggle('content'); }
-      });
-      return;
-    }
-    try { window.open(url, '_blank'); } catch (e) {}
-  }
-
   function isWatchedFromCache(tmdbId, type) {
     if (!_watchedCache || !tmdbId) return false;
     var s = String(tmdbId);
@@ -16648,11 +16581,6 @@
             if (rateLine.length) rateLine.after(mwBtn);
           }
         }
-      }
-
-      // Рейтинг Trakt справа от IMDB (кликабельный — открывает страницу на Trakt)
-      if (e.object.method === 'tv' || e.object.method === 'movie') {
-        try { renderTraktRatingOnFullCard(e.object.activity.render(), e.data.id, e.object.method); } catch (err) {}
       }
 
       // Magic Button — вставляем в .buttons--container, откуда «Смотреть» берёт список источников
