@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.89';
+  var PLUGIN_VERSION = '3.2.90';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -15468,7 +15468,10 @@
       if (!rateLine.length || !document.body.contains(rateLine[0])) return;
       ensureTraktRatingStyle();
       rateLine.find('.rate--trakt').remove();
-      var url = 'https://trakt.tv/' + (type === 'show' ? 'shows' : 'movies') + '/' + (media.ids.slug || media.ids.trakt);
+      // app.trakt.tv — новое веб-приложение Trakt: локализовано (в т.ч. ru-RU) и само выбирает
+      // язык по языку устройства (Accept-Language) или по выбору в его настройках (cookie
+      // trakt-locale). Параметра языка в URL нет. Старый trakt.tv открывался по-английски.
+      var url = 'https://app.trakt.tv/' + (type === 'show' ? 'shows' : 'movies') + '/' + (media.ids.slug || media.ids.trakt);
       var el = $('<div class="full-start__rate rate--trakt selector"><div></div><div class="source--name">Trakt</div></div>');
       el.children().first().text(rating.toFixed(1));
       el.on('hover:enter', function () { openTraktPage(url, media.title); });
