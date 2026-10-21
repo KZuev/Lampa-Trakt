@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.91';
+  var PLUGIN_VERSION = '3.2.92';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -15466,11 +15466,8 @@
     var isMovie = type === 'movie';
     var isShow = type === 'tv' || type === 'show';
     if (!isMovie && !isShow) return;
-    // Полностью просмотренный фильм/завершённый сериал уже отмечен галочкой — шкала
-    // на 100% ничего не добавляет. Для сериала — именно completedShows (все вышедшие
-    // серии просмотрены), а не «shows» (там же и просто начатые — им шкала как раз нужна).
-    if (isMovie && isWatchedFromCache(data.id, 'movie')) return;
-    if (isShow && _watchedCache && _watchedCache.completedShows && _watchedCache.completedShows.has(String(data.id))) return;
+    // История не отменяет текущий прогресс: фильм может быть на пересмотре,
+    // а данные Up Next — свежее общего кэша просмотренных сериалов.
     var pct = null;
     var upnextProgress = resolveUpnextProgress(data);
     if (upnextProgress && upnextProgress.percent !== null && upnextProgress.percent !== undefined) {
@@ -15480,11 +15477,16 @@
       if (map && map.has(String(data.id))) pct = map.get(String(data.id));
     }
     pct = Number(pct);
-    if (!pct || pct <= 0) return;
-    pct = Math.min(100, pct);
+    if (!Number.isFinite(pct) || pct <= 0 || pct >= 100) return;
     var cardNode = typeof cardInstance.render === 'function' ? cardInstance.render(true) : null;
     var cardView = cardNode && cardNode.querySelector ? cardNode.querySelector('.card__view') : null;
-    if (!cardView || cardView.querySelector('.trakt-progress-bar--general')) return;
+    if (!cardView) return;
+    var existing = cardView.querySelector('.trakt-progress-bar--general');
+    if (existing) {
+      var existingFill = existing.querySelector('.trakt-progress-bar__fill');
+      if (existingFill) existingFill.style.width = pct + '%';
+      return;
+    }
     var bar = document.createElement('div');
     bar.className = 'trakt-progress-bar trakt-progress-bar--general ' + (isMovie ? 'trakt-progress-bar--movie' : 'trakt-progress-bar--show');
     var fill = document.createElement('div');
