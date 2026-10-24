@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.94';
+  var PLUGIN_VERSION = '3.2.95';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -2346,6 +2346,10 @@
       }).fail(function (jqXHR) {
         var status = jqXHR && jqXHR.status ? jqXHR.status : 0;
         var responseHeaders = parseResponseHeaders(jqXHR);
+        _authLogAdd('api_request_failed', {
+          endpoint: String(url || '').split('?')[0], method: method, status: status,
+          retryAfter: responseHeaders['retry-after'] || null
+        });
         reject(Object.assign(new Error('TraktTV API Error'), {
           status: status,
           headers: responseHeaders,
@@ -4500,6 +4504,21 @@
     });
     return sorted;
   }
+  function showListLoadError(component, error, type) {
+    var status = Number(error && error.status) || 0;
+    _authLogAdd('list_load_failed', { list: type, status: status });
+    component.empty();
+    var title = t$2('trakt_load_failed_title', 'Could not load Trakt data');
+    var detail = t$2('trakt_load_failed_detail', 'Request failed. Refresh to retry.') + ' (' + (status || 'timeout/network') + ')';
+    try {
+      if (component.html && typeof component.html.find === 'function') {
+        component.html.find('.empty__title').text(title);
+        component.html.find('.empty__descr').text(detail);
+      }
+    } catch (e) {}
+    notify(title + ': ' + (status || 'timeout/network'));
+  }
+
   function baseComponent(object, type) {
     var comp;
     var total_pages = 0;
@@ -4550,7 +4569,7 @@
             setTimeout(function() { _captureHeightSnapshot('TRAKT-' + type); }, 500);
             if (type === 'watchlist') setTimeout(function () { try { insertUpcomingDivider(_this); } catch(e) {} }, 0);
             if (type === 'upnext') setTimeout(function () { try { insertUpnextNotStartedDivider(_this); } catch(e) {} }, 0);
-          })["catch"](function () { _this.empty(); });
+          })["catch"](function (error) { showListLoadError(_this, error, type); });
         },
         onNext: function onNext(resolve, reject) {
           var _this2 = this;
@@ -4669,7 +4688,7 @@
           if (total_pages > 1 && _this3.activity && _this3.activity.scroll) _this3.activity.scroll.onEnd = _this3.next.bind(_this3);
           if (type === 'watchlist') setTimeout(function () { try { insertUpcomingDivider(_this3); } catch(e) {} }, 0);
           if (type === 'upnext') setTimeout(function () { try { insertUpnextNotStartedDivider(_this3); } catch(e) {} }, 0);
-        })["catch"](function () { _this3.empty(); });
+        })["catch"](function (error) { showListLoadError(_this3, error, type); });
       };
       comp.next = function () {
         var _this4 = this;
@@ -7429,6 +7448,8 @@
       trakt_remove_from_list_error: {
         ru: "Ошибка удаления элемента из списка",
       },
+      trakt_load_failed_title: { ru: 'Не удалось загрузить данные Trakt', en: 'Could not load Trakt data' },
+      trakt_load_failed_detail: { ru: 'Ошибка запроса. Нажмите «Обновить», чтобы повторить.', en: 'Request failed. Refresh to retry.' },
       trakt_list_action_error: {
         ru: "Ошибка операции со списком",
       },
@@ -17359,6 +17380,7 @@
           if (line && Array.isArray(line.results) && line.results.length) call(line);else call();
         };
         timeoutId = setTimeout(function () {
+          if (!staleLine) _authLogAdd('row_deadline', { row: config.name, deadlineMs: deadline });
           finish(staleLine);
         }, deadline);
         var _rowExtraParams = typeof config.apiParams === 'function' ? config.apiParams() : (config.apiParams || {});
