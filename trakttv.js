@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.99';
+  var PLUGIN_VERSION = '3.2.100';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -3195,21 +3195,16 @@
     trending: function trending(params) {
       var page = Math.max(1, parseInt(params && params.page, 10) || 1);
       var limit = Math.max(1, parseInt(params && params.limit, 10) || 36);
-      var query = new URLSearchParams({ extended: 'full,images', page: String(page), limit: String(limit) });
-      if (isTraktHalloweenEnabled()) query.set('theme', 'halloween');
-      return fetchWithMeta('/media/trending?' + query.toString()).then(function(response) {
+      return loadCompleteTrending().then(function(items) {
+        // Build the complete catalog at once; the home row applies its own displayLimit.
+        var slice = page === 1 ? items : [];
         var line = createLinePayload({
           title: t$2('trakttv_source_trending', 'Trending'), path: 'media/trending',
-          items: response.data, headers: response.headers, page: page, limit: limit, typeHint: 'media'
+          items: slice, headers: {}, page: page, limit: limit, typeHint: 'media'
         });
-        // Some clients cannot read pagination headers; Trakt may also cap the
-        // requested limit. A short nonempty page is not proof that the feed ended.
-        var pageCount = Number(response.headers && response.headers['x-pagination-page-count']);
-        if (!(Number.isFinite(pageCount) && pageCount > 0)) {
-          var hasItems = Array.isArray(response.data) && response.data.length > 0;
-          line.total_pages = hasItems ? page + 1 : page;
-          if (hasItems) line.total = Math.max(Number(line.total) || 0, page * limit + 1);
-        }
+        line.total = items.length;
+        line.total_pages = 1;
+        line.page = page;
         return enrichWithTmdbLocale(line);
       });
     },
@@ -19141,6 +19136,45 @@
     }
   }
   // Seasonal dates and orange palette follow trakt/trakt-web (2026-10-31).
+  var _completeTrendingCache = null;
+  var _completeTrendingPending = {};
+  function loadCompleteTrending() {
+    var theme = isTraktHalloweenEnabled() ? 'halloween' : '';
+    var key = buildAuthScope(false) + ':' + theme;
+    if (_completeTrendingCache && _completeTrendingCache.key === key && Date.now() - _completeTrendingCache.time < 60000) {
+      return Promise.resolve(_completeTrendingCache.items);
+    }
+    if (_completeTrendingPending[key]) return _completeTrendingPending[key];
+    var all = [], seen = new Set();
+    function load(page) {
+      var query = new URLSearchParams({ extended: 'full,images', page: String(page), limit: '100' });
+      if (theme) query.set('theme', theme);
+      return fetchWithMeta('/media/trending?' + query.toString()).then(function(response) {
+        if (!Array.isArray(response.data)) throw new Error('Invalid Trakt trending response');
+        var batch = response.data;
+        if (!batch.length) return all;
+        var added = 0;
+        batch.forEach(function(item) {
+          var media = item.movie || item.show || item;
+          var ids = media.ids || {};
+          var id = (item.show ? 'show:' : 'movie:') + (ids.trakt || ids.tmdb || ids.slug || '');
+          if (id === 'show:' || id === 'movie:') throw new Error('Missing Trakt trending ID');
+          if (!seen.has(id)) { seen.add(id); all.push(item); added++; }
+        });
+        if (!added) throw new Error('Trakt repeated a trending page');
+        if (page >= 100) throw new Error('Trakt trending pagination did not end');
+        return load(page + 1);
+      });
+    }
+    var pending = load(1).then(function(items) {
+      _completeTrendingCache = { key: key, time: Date.now(), items: items };
+      _authLogAdd('trending_loaded', { total: items.length, theme: theme || 'default' });
+      return items;
+    }).finally(function() { delete _completeTrendingPending[key]; });
+    _completeTrendingPending[key] = pending;
+    return pending;
+  }
+
   function isTraktHalloweenDate(now) {
     var month = now.getMonth() + 1;
     var day = now.getDate();
