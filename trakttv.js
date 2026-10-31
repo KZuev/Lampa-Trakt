@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.96';
+  var PLUGIN_VERSION = '3.2.97';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -3190,6 +3190,18 @@
         }).catch(function() {
           return buildBase(formatted.results || []);
         });
+      });
+    },
+    trending: function trending(params) {
+      var page = Math.max(1, parseInt(params && params.page, 10) || 1);
+      var limit = Math.max(1, parseInt(params && params.limit, 10) || 36);
+      var query = new URLSearchParams({ extended: 'full,images', page: String(page), limit: String(limit) });
+      if (isTraktHalloweenEnabled()) query.set('theme', 'halloween');
+      return fetchWithMeta('/media/trending?' + query.toString()).then(function(response) {
+        return enrichWithTmdbLocale(createLinePayload({
+          title: t$2('trakttv_source_trending', 'Trending'), path: 'media/trending',
+          items: response.data, headers: response.headers, page: page, limit: limit, typeHint: 'media'
+        }));
       });
     },
     upnext: function upnext(params) {
@@ -16982,6 +16994,7 @@
   }
   function buildRowCacheKey(config, params, screen) {
     var rowName = config && config.name ? config.name : 'unknown';
+    if (rowName === 'TraktTrendingRow') rowName += isTraktHalloweenEnabled() ? ':halloween' : ':default';
     var categoryContext = params && params.url ? String(params.url) : '';
     var authFingerprint = getAuthFingerprint();
     var filtersFingerprint = getSourceFilterFingerprint();
@@ -17550,6 +17563,17 @@
       screen: ['main'],
       onMore: createOnMoreHandler(_recMainConfig),
       call: createRowCall(_recMainConfig)
+    });
+    // Same-index rows are inserted in reverse order: below Calendar, above Recommendations.
+    var trendingConfig = {
+      name: 'TraktTrendingRow', displayTitle: t('trakttv_source_trending', 'Trending'),
+      apiMethod: 'trending', component: 'trakt_trending', limit: 36, displayLimit: 20,
+      traktRow: 'trending'
+    };
+    _traktRowsByTitle[trendingConfig.displayTitle] = trendingConfig.component;
+    Lampa.ContentRows.add({
+      name: trendingConfig.name, title: trendingConfig.displayTitle, index: 0, screen: ['main'],
+      onMore: createOnMoreHandler(trendingConfig), call: createRowCall(trendingConfig)
     });
     // 3. Calendar
     if (Api && typeof Api.get === 'function') {
@@ -19093,9 +19117,12 @@
     return (month === 10 && (day > 30 || (day === 30 && now.getHours() >= 20))) ||
       (month === 11 && day <= 2);
   }
-  function applyTraktSeasonalTheme() {
+  function isTraktHalloweenEnabled() {
     var mode = Lampa.Storage.field('trakt_seasonal_theme') || 'auto';
-    var enabled = mode === 'halloween' || (mode === 'auto' && isTraktHalloweenDate(new Date()));
+    return mode === 'halloween' || (mode === 'auto' && isTraktHalloweenDate(new Date()));
+  }
+  function applyTraktSeasonalTheme() {
+    var enabled = isTraktHalloweenEnabled();
     var root = document.documentElement;
     if (enabled) {
       // sRGB fallback for Trakt's halloween purple-500: oklch(56.1% .1804 52).
@@ -19112,7 +19139,7 @@
     var style = document.createElement('style');
     style.id = 'trakt-seasonal-style';
     style.textContent = '.trakt-halloween .trakt-head-icon{filter:drop-shadow(0 0 9px rgba(255,130,32,.45))}' +
-      '.trakt-halloween .trakt-head-icon:before{content:"🎃";position:absolute;top:-.7em;left:-.6em;font-size:.5em;pointer-events:none}' +
+      '.trakt-halloween .trakt-head-icon:before{content:"🎃";position:absolute;top:-.45em;left:-.55em;font-size:1em;line-height:1;pointer-events:none}' +
       '.trakt-halloween .trakt-line-title__icon{color:#e9883b;filter:drop-shadow(0 0 5px rgba(255,130,32,.25))}' +
       '.trakt-halloween .trakt-upcoming-section{color:#f6dcc7}' +
       '.trakt-halloween .trakt-status-clickable{border-radius:.6em}' +
@@ -19240,6 +19267,9 @@
     } catch (error) {
       logError('Source provider registration failed', error);
     }
+    Lampa.Component.add('trakt_trending', function (object) {
+      return new baseComponent(object, 'trending');
+    });
     Lampa.Component.add('trakt_upnext', function (object) {
       _navLogEvent('factory_trakt_upnext', object || {});
       return new Catalog.upnext(object);
