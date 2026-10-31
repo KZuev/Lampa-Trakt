@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.98';
+  var PLUGIN_VERSION = '3.2.99';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -3198,10 +3198,19 @@
       var query = new URLSearchParams({ extended: 'full,images', page: String(page), limit: String(limit) });
       if (isTraktHalloweenEnabled()) query.set('theme', 'halloween');
       return fetchWithMeta('/media/trending?' + query.toString()).then(function(response) {
-        return enrichWithTmdbLocale(createLinePayload({
+        var line = createLinePayload({
           title: t$2('trakttv_source_trending', 'Trending'), path: 'media/trending',
           items: response.data, headers: response.headers, page: page, limit: limit, typeHint: 'media'
-        }));
+        });
+        // Some clients cannot read pagination headers; Trakt may also cap the
+        // requested limit. A short nonempty page is not proof that the feed ended.
+        var pageCount = Number(response.headers && response.headers['x-pagination-page-count']);
+        if (!(Number.isFinite(pageCount) && pageCount > 0)) {
+          var hasItems = Array.isArray(response.data) && response.data.length > 0;
+          line.total_pages = hasItems ? page + 1 : page;
+          if (hasItems) line.total = Math.max(Number(line.total) || 0, page * limit + 1);
+        }
+        return enrichWithTmdbLocale(line);
       });
     },
     upnext: function upnext(params) {
@@ -4603,7 +4612,15 @@
               if (type === 'watchlist') setTimeout(function () { try { insertUpcomingDivider(_this2); } catch(e) {} }, 0);
               if (type === 'upnext') setTimeout(function () { try { insertUpnextNotStartedDivider(_this2); } catch(e) {} }, 0);
               waitload = false;
-            })["catch"](function () { waitload = false; try { _listLogAdd('bC.onNext catch→reject type=' + type); } catch(e) {} reject.call(_this2); });
+            })["catch"](function (error) {
+              if (type === 'trending') {
+                object.page = Math.max(1, (Number(object.page) || 2) - 1);
+                _authLogAdd('list_load_failed', { list: type, page: params.page, status: Number(error && error.status) || 0 });
+              }
+              waitload = false;
+              try { _listLogAdd('bC.onNext catch→reject type=' + type); } catch(e) {}
+              reject.call(_this2);
+            });
           } else { try { _listLogAdd('bC.onNext end→reject type=' + type + ' pg=' + object.page + '/' + total_pages); } catch(e) {} reject.call(this); }
         },
         onController: function onController(controller) {
@@ -4722,7 +4739,10 @@
             if (type === 'upnext') data = rearrangeUpnextNotStarted(data);
             _this4.append(data && _typeof(data) === 'object' && Array.isArray(data.results) ? data : { results: [] });
             waitload = false;
-          })["catch"](function () { waitload = false; });
+          })["catch"](function () {
+            if (type === 'trending') object.page = Math.max(1, (Number(object.page) || 2) - 1);
+            waitload = false;
+          });
         }
       };
       comp.cardRender = function (_, element, card) {

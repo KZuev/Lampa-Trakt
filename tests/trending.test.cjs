@@ -8,11 +8,13 @@ const end = source.indexOf('    upnext: function upnext(', start);
 const requests = [];
 let themed = true;
 const items = [{id: 31}, {id: 8}, {id: 19}];
+let payload = items;
+let headers = {'x-pagination-page-count': '4'};
 const context = vm.createContext({
   URLSearchParams, isTraktHalloweenEnabled: () => themed,
-  fetchWithMeta: async url => { requests.push(url); return {data: items, headers: {pages: 4}}; },
+  fetchWithMeta: async url => { requests.push(url); return {data: payload, headers}; },
   t$2: (k,f) => f,
-  createLinePayload: p => ({results:p.items, page:p.page, limit:p.limit, total_pages:p.headers.pages}),
+  createLinePayload: p => ({results:p.items, page:p.page, limit:p.limit, total_pages:Number(p.headers['x-pagination-page-count']) || 1}),
   enrichWithTmdbLocale: x => x
 });
 const api = vm.runInContext('({' + source.slice(start, end) + '})', context);
@@ -27,5 +29,19 @@ const api = vm.runInContext('({' + source.slice(start, end) + '})', context);
   themed = false;
   await api.trending({page:1});
   assert.equal(new URL(requests[1], 'https://api.trakt.tv').searchParams.has('theme'), false);
-  console.log('Trending checks passed: seasonal filter, pagination, API order, normal mode');
+  headers = {};
+  const short = await api.trending({page:1,limit:36});
+  assert.equal(short.results.length, 3);
+  assert.equal(short.total_pages, 2);
+  assert.ok(short.total > 36);
+  const second = await api.trending({page:2,limit:36});
+  assert.equal(second.total_pages, 3);
+  payload = [];
+  const last = await api.trending({page:3,limit:36});
+  assert.equal(last.total_pages, 3);
+  payload = items;
+  headers = {'x-pagination-page-count': '1'};
+  const explicitEnd = await api.trending({page:1,limit:36});
+  assert.equal(explicitEnd.total_pages, 1);
+  console.log('Trending checks passed: short pages, missing headers, empty end, explicit count, seasonal filter and order');
 })().catch(e => { console.error(e); process.exitCode = 1; });
