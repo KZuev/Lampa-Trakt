@@ -384,7 +384,7 @@
   }
 
   var API_URL = 'https://api.trakt.tv';
-  var PLUGIN_VERSION = '3.2.97';
+  var PLUGIN_VERSION = '3.2.98';
 
   var _AT_MIGRATE_MAP = {
     trakt_magic_enabled:    'trakt_at_enabled',
@@ -9765,6 +9765,7 @@
     var watchlistTitle = t('trakttv_watchlist', 'Watchlist');
     var upNextTitle = t('trakttv_upnext', 'Up Next');
     var calendarTitle = t('trakttv_calendar', 'Calendar');
+    var trendingTitle = t('trakttv_source_trending', 'Trending');
     var recommendationsTitle = t('trakttv_recommendations', 'Recommendations');
     var menuTitle = t('trakttv_menu_title', 'Trakt.TV');
     var myListsTitle = t('trakt_my_lists', 'My Lists');
@@ -9778,6 +9779,11 @@
     var timetable = $("<li class=\"menu__item selector\">\n    <div class=\"menu__ico\">".concat(icons.TRAKT_ICON, "</div>\n    <div class=\"menu__text\">").concat(calendarTitle, "</div>\n    </li>"));
     var myLists = $("<li class=\"menu__item selector\">\n        <div class=\"menu__ico\">".concat(icons.TRAKT_ICON, " </div>\n        <div class=\"menu__text\">").concat(myListsTitle, "</div>\n    </li>"));
     var likedLists = $("<li class=\"menu__item selector\">\n        <div class=\"menu__ico\">".concat(icons.TRAKT_ICON, " </div>\n        <div class=\"menu__text\">").concat(likedListsTitle, "</div>\n    </li>"));
+    var trending = $('<li class="menu__item selector"><div class="menu__ico">' + icons.TRAKT_ICON + '</div><div class="menu__text"></div></li>');
+    trending.find('.menu__text').text(trendingTitle);
+    trending.on('hover:enter', function () {
+      Lampa.Activity.push({ url: '', title: trendingTitle, component: 'trakt_trending', page: 1 });
+    });
     timetable.on('hover:enter', function () {
       Lampa.Activity.push({
         url: '',
@@ -9847,6 +9853,9 @@
       title: calendarTitle,
       component: 'trakt_timetable_all'
     }, {
+      title: trendingTitle,
+      component: 'trakt_trending'
+    }, {
       title: recommendationsTitle,
       component: 'trakttv_recommendations',
       toggleOption: 'trakttv_show_recommendations'
@@ -9866,6 +9875,7 @@
       trakt_upnext: upnext,
       trakt_watching: watchingItem,
       trakt_timetable_all: timetable,
+      trakt_trending: trending,
       trakt_my_lists: myLists,
       trakt_lists: likedLists
     };
